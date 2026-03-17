@@ -10,15 +10,20 @@
 # └──────────────────────────────────────────────────────────────────────────┘
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PLAY 1 — Proxmox: clone, configure, start, bootstrap OS, discover IP
+# PLAY 1 — Proxmox: create VM, import disk, configure, start, discover IP
 # ══════════════════════════════════════════════════════════════════════════════
-- name: "Provision VM from Proxmox template"
+- name: "Provision VM from Jammy image"
   hosts: proxmox
   gather_facts: false
   vars:
     pve_api:      "https://{{ ansible_host }}:8006/api2/json"
     pve_token:    "PVEAPIToken={{ proxmox_token_id }}={{ proxmox_token_secret }}"
     proxmox_node: "pve"
+    storage:      "zfe1_pve3"
+    jammy_image:  "/var/lib/vz/template/iso/jammy-server-cloudimg-amd64.img"
+    vm_cpu:       2
+    vm_ram:       2048
+    vm_disk:      "20G"
 
   tasks:
 
@@ -36,40 +41,67 @@
       ansible.builtin.set_fact:
         resolved_vm_id: "{{ next_vmid_api.json.data | int }}"
 
-    - name: "3. Clone template 9000 → VMID {{ resolved_vm_id }}"
+    - name: "3. Create VM {{ resolved_vm_id }}"
       ansible.builtin.uri:
-        url: "{{ pve_api }}/nodes/{{ proxmox_node }}/qemu/9000/clone"
+        url: "{{ pve_api }}/nodes/{{ proxmox_node }}/qemu"
         method: POST
         headers:
           Authorization: "{{ pve_token }}"
         body_format: form-urlencoded
         body:
-          newid: "{{ resolved_vm_id }}"
-          name:  "{{ new_vm_name }}"
-          full:  1
+          vmid:    "{{ resolved_vm_id }}"
+          name:    "{{ new_vm_name }}"
+          cores:   "{{ vm_cpu }}"
+          memory:  "{{ vm_ram }}"
+          net0:    "virtio,bridge=vmbr0"
+          ostype:  l26
         validate_certs: false
         status_code: 200
-      register: clone_job
       delegate_to: localhost
 
-    - name: "4. Poll clone task until complete"
+    - name: "4. Import Jammy disk into {{ storage }}"
+      ansible.builtin.command: >
+        qm importdisk {{ resolved_vm_id }}
+        {{ jammy_image }}
+        {{ storage }}
+        --format qcow2
+      register: importdisk_out
+      changed_when: true
+
+    - name: "5. Configure VM hardware + cloud-init drive"
       ansible.builtin.uri:
-        url: "{{ pve_api }}/nodes/{{ proxmox_node }}/tasks/{{ clone_job.json.data }}/status"
-        method: GET
+        url: "{{ pve_api }}/nodes/{{ proxmox_node }}/qemu/{{ resolved_vm_id }}/config"
+        method: PUT
         headers:
           Authorization: "{{ pve_token }}"
+        body_format: form-urlencoded
+        body:
+          scsihw:  "virtio-scsi-pci"
+          scsi0:   "{{ storage }}:vm-{{ resolved_vm_id }}-disk-0,discard=on"
+          ide2:    "{{ storage }}:cloudinit"
+          boot:    "order=scsi0"
+          serial0: "socket"
+          vga:     "serial0"
+          agent:   "enabled=1"
         validate_certs: false
-      register: task_poll
-      until: task_poll.json.data.status == "stopped"
-      retries: 60
-      delay: 10
-      failed_when:
-        - task_poll.json.data.status == "stopped"
-        - task_poll.json.data.exitstatus is defined
-        - task_poll.json.data.exitstatus != "OK"
+        status_code: 200
       delegate_to: localhost
 
-    - name: "5. Set cloud-init — user / password / DHCP"
+    - name: "6. Resize disk to {{ vm_disk }}"
+      ansible.builtin.uri:
+        url: "{{ pve_api }}/nodes/{{ proxmox_node }}/qemu/{{ resolved_vm_id }}/resize"
+        method: PUT
+        headers:
+          Authorization: "{{ pve_token }}"
+        body_format: form-urlencoded
+        body:
+          disk: "scsi0"
+          size: "{{ vm_disk }}"
+        validate_certs: false
+        status_code: 200
+      delegate_to: localhost
+
+    - name: "7. Set cloud-init — user / password / DHCP"
       ansible.builtin.uri:
         url: "{{ pve_api }}/nodes/{{ proxmox_node }}/qemu/{{ resolved_vm_id }}/config"
         method: PUT
@@ -84,7 +116,7 @@
         status_code: 200
       delegate_to: localhost
 
-    - name: "6. Start VM {{ resolved_vm_id }}"
+    - name: "8. Start VM {{ resolved_vm_id }}"
       ansible.builtin.uri:
         url: "{{ pve_api }}/nodes/{{ proxmox_node }}/qemu/{{ resolved_vm_id }}/status/start"
         method: POST
@@ -94,7 +126,7 @@
         status_code: 200
       delegate_to: localhost
 
-    - name: "7. Configure user + enable SSH password auth via QEMU agent"
+    - name: "9. Configure user + enable SSH password auth via QEMU agent"
       ansible.builtin.uri:
         url: "{{ pve_api }}/nodes/{{ proxmox_node }}/qemu/{{ resolved_vm_id }}/agent/exec"
         method: POST
@@ -106,8 +138,9 @@
             - "bash"
             - "-c"
             - |
-              # Ensure user exists
+              # Ensure user exists with valid shell
               id {{ vm_user }} &>/dev/null || useradd -m -s /bin/bash {{ vm_user }}
+              usermod -s /bin/bash {{ vm_user }}
 
               # Set password
               echo "{{ vm_user }}:{{ vm_password }}" | chpasswd
@@ -116,24 +149,17 @@
               echo '{{ vm_user }} ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/{{ vm_user }}
               chmod 440 /etc/sudoers.d/{{ vm_user }}
 
-              # Patch main sshd_config
+              # Enable SSH password authentication
               sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
-              sed -i 's/^#*KbdInteractiveAuthentication.*/KbdInteractiveAuthentication yes/' /etc/ssh/sshd_config
-
-              # Override cloud-init SSH drop-in (takes precedence over main config)
               echo "PasswordAuthentication yes" > /etc/ssh/sshd_config.d/99-ansible.conf
-              echo "KbdInteractiveAuthentication yes" >> /etc/ssh/sshd_config.d/99-ansible.conf
 
-              # Ensure user has a valid shell
-              usermod -s /bin/bash {{ vm_user }}
-
-              # Remove nologin lockfile left by cloud-init
+              # Remove nologin lockfiles
               rm -f /etc/nologin /run/nologin
 
-              # Restart SSH to apply changes
-              systemctl restart ssh || systemctl restart sshd
+              # Restart SSH
+              systemctl restart ssh
 
-              # Regenerate machine-id properly
+              # Regenerate machine-id
               rm -f /etc/machine-id
               systemd-machine-id-setup
 
@@ -145,11 +171,11 @@
       delay: 5
       delegate_to: localhost
 
-    - name: "8. Wait for reboot to complete"
+    - name: "10. Wait for reboot to complete"
       ansible.builtin.pause:
         seconds: 30
 
-    - name: "9. Discover VM IP via QEMU guest agent"
+    - name: "11. Discover VM IP via QEMU guest agent"
       ansible.builtin.uri:
         url: "{{ pve_api }}/nodes/{{ proxmox_node }}/qemu/{{ resolved_vm_id }}/agent/network-get-interfaces"
         method: GET
@@ -168,7 +194,7 @@
       delay: 5
       delegate_to: localhost
 
-    - name: "10. Extract VM IP fact"
+    - name: "12. Extract VM IP fact"
       ansible.builtin.set_fact:
         discovered_vm_ip: >-
           {{
@@ -181,11 +207,11 @@
             | first
           }}
 
-    - name: "11. Print discovered IP"
+    - name: "13. Print discovered IP"
       ansible.builtin.debug:
         msg: "VM {{ resolved_vm_id }} is live at {{ discovered_vm_ip }}"
 
-    - name: "12. Add new VM to in-memory inventory"
+    - name: "14. Add new VM to in-memory inventory"
       ansible.builtin.add_host:
         name:                   "new_vm"
         ansible_host:           "{{ discovered_vm_ip }}"
@@ -207,15 +233,15 @@
 
   tasks:
 
-    - name: "13. Wait for SSH to become available"
+    - name: "15. Wait for SSH to become available"
       ansible.builtin.wait_for_connection:
         delay:   10
         timeout: 300
 
-    - name: "14. Gather facts"
+    - name: "16. Gather facts"
       ansible.builtin.setup:
 
-    - name: "15. Write setup script to /tmp/setup.sh"
+    - name: "17. Write setup script to /tmp/setup.sh"
       ansible.builtin.copy:
         dest:    /tmp/setup.sh
         mode:    "0700"
@@ -312,17 +338,17 @@
           ufw-docker status
       become: false
 
-    - name: "16. Run setup script"
+    - name: "18. Run setup script"
       ansible.builtin.command: /tmp/setup.sh
       become: true
       register: setup_output
 
-    - name: "17. Remove setup script"
+    - name: "19. Remove setup script"
       ansible.builtin.file:
         path:  /tmp/setup.sh
         state: absent
       become: true
 
-    - name: "18. Print setup output"
+    - name: "20. Print setup output"
       ansible.builtin.debug:
         msg: "{{ setup_output.stdout_lines }}"
