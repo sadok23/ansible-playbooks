@@ -116,9 +116,13 @@
               echo '{{ vm_user }} ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/{{ vm_user }}
               chmod 440 /etc/sudoers.d/{{ vm_user }}
 
-              # Enable SSH password authentication
+              # Patch main sshd_config
               sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
               sed -i 's/^#*KbdInteractiveAuthentication.*/KbdInteractiveAuthentication yes/' /etc/ssh/sshd_config
+
+              # Override cloud-init SSH drop-in (takes precedence over main config)
+              echo "PasswordAuthentication yes" > /etc/ssh/sshd_config.d/99-ansible.conf
+              echo "KbdInteractiveAuthentication yes" >> /etc/ssh/sshd_config.d/99-ansible.conf
 
               # Ensure user has a valid shell
               usermod -s /bin/bash {{ vm_user }}
@@ -126,7 +130,7 @@
               # Remove nologin lockfile left by cloud-init
               rm -f /etc/nologin /run/nologin
 
-              # Restart SSH
+              # Restart SSH to apply changes
               systemctl restart ssh || systemctl restart sshd
 
               # Regenerate machine-id properly
