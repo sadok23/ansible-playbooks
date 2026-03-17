@@ -1,14 +1,16 @@
 ---
 # ┌──────────────────────────────────────────────────────────────────────────┐
-# │  Semaphore Variable Group — add these keys:                              │
-# │    new_vm_name   →  dockhand-node                                        │
-# │    vm_user       →  devops                                               │
-# │    vm_password   →  YourSecurePass!          (mark as secret)            │
-# │    ssh_ip        →  192.168.1.10                                         │
+# │  Semaphore Variable Group (Extra Variables — JSON):                      │
+# │  {                                                                       │
+# │    "new_vm_name": "dockhand-node",                                       │
+# │    "vm_user":     "devops",                                              │
+# │    "vm_password": "YourSecurePass!",                                     │
+# │    "ssh_ip":      "192.168.1.10"                                         │
+# │  }                                                                       │
 # └──────────────────────────────────────────────────────────────────────────┘
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PLAY 1 — Proxmox: clone template 9000, configure cloud-init, start VM
+# PLAY 1 — Proxmox: clone, configure, start, bootstrap OS, discover IP
 # ══════════════════════════════════════════════════════════════════════════════
 - name: "Provision VM from Proxmox template"
   hosts: proxmox
@@ -77,11 +79,51 @@
         state:            started
       delegate_to: localhost
 
-    - name: "6. Wait — let cloud-init finish and QEMU agent come up"
+    - name: "6. Configure user + enable SSH password auth via QEMU agent"
+      ansible.builtin.uri:
+        url: "{{ pve_api }}/nodes/{{ proxmox_node }}/qemu/{{ resolved_vm_id }}/agent/exec"
+        method: POST
+        headers:
+          Authorization: "{{ pve_token }}"
+        body_format: json
+        body:
+          command:
+            - "bash"
+            - "-c"
+            - |
+              # Ensure user exists
+              id {{ vm_user }} &>/dev/null || useradd -m -s /bin/bash {{ vm_user }}
+
+              # Set password
+              echo "{{ vm_user }}:{{ vm_password }}" | chpasswd
+
+              # Grant passwordless sudo
+              echo '{{ vm_user }} ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/{{ vm_user }}
+              chmod 440 /etc/sudoers.d/{{ vm_user }}
+
+              # Enable SSH password authentication
+              sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+              sed -i 's/^#*KbdInteractiveAuthentication.*/KbdInteractiveAuthentication yes/' /etc/ssh/sshd_config
+
+              # Restart SSH
+              systemctl restart ssh || systemctl restart sshd
+
+              # Reset machine-id
+              truncate -s 0 /etc/machine-id
+
+              reboot
+        validate_certs: false
+      register: agent_exec
+      until: agent_exec.status == 200
+      retries: 30
+      delay: 5
+      delegate_to: localhost
+
+    - name: "7. Wait for reboot to complete"
       ansible.builtin.pause:
         seconds: 30
 
-    - name: "7. Discover VM IP via QEMU guest agent"
+    - name: "8. Discover VM IP via QEMU guest agent"
       ansible.builtin.uri:
         url: "{{ pve_api }}/nodes/{{ proxmox_node }}/qemu/{{ resolved_vm_id }}/agent/network-get-interfaces"
         method: GET
@@ -100,7 +142,7 @@
       delay: 5
       delegate_to: localhost
 
-    - name: "8. Extract VM IP fact"
+    - name: "9. Extract VM IP fact"
       ansible.builtin.set_fact:
         discovered_vm_ip: >-
           {{
@@ -113,11 +155,11 @@
             | first
           }}
 
-    - name: "9. Print discovered IP"
+    - name: "10. Print discovered IP"
       ansible.builtin.debug:
         msg: "VM {{ resolved_vm_id }} is live at {{ discovered_vm_ip }}"
 
-    - name: "10. Add new VM to in-memory inventory"
+    - name: "11. Add new VM to in-memory inventory"
       ansible.builtin.add_host:
         name:                   "new_vm"
         ansible_host:           "{{ discovered_vm_ip }}"
@@ -139,15 +181,15 @@
 
   tasks:
 
-    - name: "11. Wait for SSH to become available"
+    - name: "12. Wait for SSH to become available"
       ansible.builtin.wait_for_connection:
-        delay:   20
+        delay:   10
         timeout: 300
 
-    - name: "12. Gather facts"
+    - name: "13. Gather facts"
       ansible.builtin.setup:
 
-    - name: "13. Write setup script to /tmp/setup.sh"
+    - name: "14. Write setup script to /tmp/setup.sh"
       ansible.builtin.copy:
         dest:    /tmp/setup.sh
         mode:    "0700"
@@ -244,17 +286,17 @@
           ufw-docker status
       become: false
 
-    - name: "14. Run setup script"
+    - name: "15. Run setup script"
       ansible.builtin.command: /tmp/setup.sh
       become: true
       register: setup_output
 
-    - name: "15. Remove setup script"
+    - name: "16. Remove setup script"
       ansible.builtin.file:
         path:  /tmp/setup.sh
         state: absent
       become: true
 
-    - name: "16. Print setup output"
+    - name: "17. Print setup output"
       ansible.builtin.debug:
         msg: "{{ setup_output.stdout_lines }}"
