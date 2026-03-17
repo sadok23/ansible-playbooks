@@ -36,9 +36,9 @@
       ansible.builtin.set_fact:
         resolved_vm_id: "{{ next_vmid_api.json.data | int }}"
 
-    - name: "3. Clone template 9000 → VMID {{ resolved_vm_id }}"
+    - name: "3. Clone template 131 → VMID {{ resolved_vm_id }}"
       ansible.builtin.uri:
-        url: "{{ pve_api }}/nodes/{{ proxmox_node }}/qemu/9000/clone"
+        url: "{{ pve_api }}/nodes/{{ proxmox_node }}/qemu/131/clone"
         method: POST
         headers:
           Authorization: "{{ pve_token }}"
