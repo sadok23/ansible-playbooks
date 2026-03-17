@@ -37,23 +37,39 @@
         resolved_vm_id: "{{ next_vmid_api.json.data | int }}"
 
     - name: "3. Clone template 9000 → VMID {{ resolved_vm_id }}"
-      community.general.proxmox_kvm:
-        api_host:         "{{ ansible_host }}"
-        api_user:         "{{ proxmox_token_id.split('!')[0] }}"
-        api_token_id:     "{{ proxmox_token_id.split('!')[1] }}"
-        api_token_secret: "{{ proxmox_token_secret }}"
-        node:             "{{ proxmox_node }}"
-        vmid:             9000
-        clone:            9000
-        newid:            "{{ resolved_vm_id }}"
-        name:             "{{ new_vm_name }}"
-        full:             true
-        agent:            1
-        state:            present
-        timeout:          600
+      ansible.builtin.uri:
+        url: "{{ pve_api }}/nodes/{{ proxmox_node }}/qemu/9000/clone"
+        method: POST
+        headers:
+          Authorization: "{{ pve_token }}"
+        body_format: form-urlencoded
+        body:
+          newid: "{{ resolved_vm_id }}"
+          name:  "{{ new_vm_name }}"
+          full:  1
+        validate_certs: false
+        status_code: 200
+      register: clone_job
       delegate_to: localhost
 
-    - name: "4. Set cloud-init — user / password / DHCP"
+    - name: "4. Poll clone task until complete"
+      ansible.builtin.uri:
+        url: "{{ pve_api }}/nodes/{{ proxmox_node }}/tasks/{{ clone_job.json.data }}/status"
+        method: GET
+        headers:
+          Authorization: "{{ pve_token }}"
+        validate_certs: false
+      register: task_poll
+      until: task_poll.json.data.status == "stopped"
+      retries: 60
+      delay: 10
+      failed_when:
+        - task_poll.json.data.status == "stopped"
+        - task_poll.json.data.exitstatus is defined
+        - task_poll.json.data.exitstatus != "OK"
+      delegate_to: localhost
+
+    - name: "5. Set cloud-init — user / password / DHCP"
       ansible.builtin.uri:
         url: "{{ pve_api }}/nodes/{{ proxmox_node }}/qemu/{{ resolved_vm_id }}/config"
         method: PUT
@@ -68,18 +84,17 @@
         status_code: 200
       delegate_to: localhost
 
-    - name: "5. Start VM {{ resolved_vm_id }}"
-      community.general.proxmox_kvm:
-        api_host:         "{{ ansible_host }}"
-        api_user:         "{{ proxmox_token_id.split('!')[0] }}"
-        api_token_id:     "{{ proxmox_token_id.split('!')[1] }}"
-        api_token_secret: "{{ proxmox_token_secret }}"
-        node:             "{{ proxmox_node }}"
-        vmid:             "{{ resolved_vm_id }}"
-        state:            started
+    - name: "6. Start VM {{ resolved_vm_id }}"
+      ansible.builtin.uri:
+        url: "{{ pve_api }}/nodes/{{ proxmox_node }}/qemu/{{ resolved_vm_id }}/status/start"
+        method: POST
+        headers:
+          Authorization: "{{ pve_token }}"
+        validate_certs: false
+        status_code: 200
       delegate_to: localhost
 
-    - name: "6. Configure user + enable SSH password auth via QEMU agent"
+    - name: "7. Configure user + enable SSH password auth via QEMU agent"
       ansible.builtin.uri:
         url: "{{ pve_api }}/nodes/{{ proxmox_node }}/qemu/{{ resolved_vm_id }}/agent/exec"
         method: POST
@@ -119,11 +134,11 @@
       delay: 5
       delegate_to: localhost
 
-    - name: "7. Wait for reboot to complete"
+    - name: "8. Wait for reboot to complete"
       ansible.builtin.pause:
         seconds: 30
 
-    - name: "8. Discover VM IP via QEMU guest agent"
+    - name: "9. Discover VM IP via QEMU guest agent"
       ansible.builtin.uri:
         url: "{{ pve_api }}/nodes/{{ proxmox_node }}/qemu/{{ resolved_vm_id }}/agent/network-get-interfaces"
         method: GET
@@ -142,7 +157,7 @@
       delay: 5
       delegate_to: localhost
 
-    - name: "9. Extract VM IP fact"
+    - name: "10. Extract VM IP fact"
       ansible.builtin.set_fact:
         discovered_vm_ip: >-
           {{
@@ -155,11 +170,11 @@
             | first
           }}
 
-    - name: "10. Print discovered IP"
+    - name: "11. Print discovered IP"
       ansible.builtin.debug:
         msg: "VM {{ resolved_vm_id }} is live at {{ discovered_vm_ip }}"
 
-    - name: "11. Add new VM to in-memory inventory"
+    - name: "12. Add new VM to in-memory inventory"
       ansible.builtin.add_host:
         name:                   "new_vm"
         ansible_host:           "{{ discovered_vm_ip }}"
@@ -181,15 +196,15 @@
 
   tasks:
 
-    - name: "12. Wait for SSH to become available"
+    - name: "13. Wait for SSH to become available"
       ansible.builtin.wait_for_connection:
         delay:   10
         timeout: 300
 
-    - name: "13. Gather facts"
+    - name: "14. Gather facts"
       ansible.builtin.setup:
 
-    - name: "14. Write setup script to /tmp/setup.sh"
+    - name: "15. Write setup script to /tmp/setup.sh"
       ansible.builtin.copy:
         dest:    /tmp/setup.sh
         mode:    "0700"
@@ -286,17 +301,17 @@
           ufw-docker status
       become: false
 
-    - name: "15. Run setup script"
+    - name: "16. Run setup script"
       ansible.builtin.command: /tmp/setup.sh
       become: true
       register: setup_output
 
-    - name: "16. Remove setup script"
+    - name: "17. Remove setup script"
       ansible.builtin.file:
         path:  /tmp/setup.sh
         state: absent
       become: true
 
-    - name: "17. Print setup output"
+    - name: "18. Print setup output"
       ansible.builtin.debug:
         msg: "{{ setup_output.stdout_lines }}"
