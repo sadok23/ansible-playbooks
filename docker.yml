@@ -53,10 +53,15 @@
         update: true
         ciuser: "{{ vm_user }}"
         cipassword: "{{ vm_password }}"
-        # FIXED: community.general expects a dictionary for ipconfig
         ipconfig:
           ipconfig0: "ip=dhcp"
       delegate_to: localhost
+      # --- RETRY LOGIC STARTS HERE ---
+      register: update_result
+      until: update_result is not failed
+      retries: 10
+      delay: 5
+      # -------------------------------
 
     - name: "5. API: Start VM"
       community.general.proxmox_kvm:
