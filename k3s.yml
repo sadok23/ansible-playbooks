@@ -76,25 +76,33 @@
       loop: "{{ range(0, node_count | int) | list }}"
       delegate_to: localhost
 
-    - name: "6. API: Inject Identity & Sudoers"
+    - name: "6. API: Configure VM Identity & Root Password"
       ansible.builtin.uri:
         url: "https://{{ ansible_host }}:8006/api2/json/nodes/{{ node_name }}/qemu/{{ start_id | int + item }}/agent/exec"
         method: POST
-        headers: { Authorization: "PVEAPIToken={{ proxmox_token_id }}={{ proxmox_token_secret }}" }
+        headers:
+          Authorization: "PVEAPIToken={{ proxmox_token_id }}={{ proxmox_token_secret }}"
         body_format: json
         body:
-          command: 
+          command:
             - "bash"
             - "-c"
             - |
+              # Set hostname
               echo '{{ vm_prefix }}-{{ start_id | int + item }}' > /etc/hostname
-              useradd -m -s /bin/bash {{ vm_user }} || true
-              mkdir -p /home/{{ vm_user }}/.ssh
-              echo '{{ lookup('file', '~/.ssh/id_rsa.pub') }}' > /home/{{ vm_user }}/.ssh/authorized_keys
-              chown -R {{ vm_user }}:{{ vm_user }} /home/{{ vm_user }}/.ssh
-              echo '{{ vm_user }} ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/ansible
-              chmod 440 /etc/sudoers.d/ansible
+              hostname '{{ vm_prefix }}-{{ start_id | int + item }}'
+    
+              # Set root password (replace "rootpassword" with your desired password)
+              echo "root:rootpassword" | chpasswd
+    
+              # Allow root to sudo without password
+              echo 'root ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/root
+              chmod 440 /etc/sudoers.d/root
+    
+              # Reset machine ID
               truncate -s 0 /etc/machine-id
+    
+              # Reboot to apply changes
               reboot
         validate_certs: false
       register: agent_res
