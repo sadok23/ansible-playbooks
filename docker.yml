@@ -120,13 +120,19 @@
               sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
               sed -i 's/^#*KbdInteractiveAuthentication.*/KbdInteractiveAuthentication yes/' /etc/ssh/sshd_config
 
+              # Ensure user has a valid shell
+              usermod -s /bin/bash {{ vm_user }}
+
+              # Remove nologin lockfile left by cloud-init
+              rm -f /etc/nologin /run/nologin
+
               # Restart SSH
               systemctl restart ssh || systemctl restart sshd
 
-              # Reset machine-id
+              # Regenerate machine-id properly
               rm -f /etc/machine-id
               systemd-machine-id-setup
-              
+
               reboot
         validate_certs: false
       register: agent_exec
