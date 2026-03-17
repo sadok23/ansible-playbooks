@@ -124,8 +124,9 @@
               systemctl restart ssh || systemctl restart sshd
 
               # Reset machine-id
-              truncate -s 0 /etc/machine-id
-
+              rm -f /etc/machine-id
+              systemd-machine-id-setup
+              
               reboot
         validate_certs: false
       register: agent_exec
