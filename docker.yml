@@ -2,14 +2,14 @@
 # =======================================================================
 # PHASE 1: INFRASTRUCTURE PROVISIONING (PROXMOX API)
 # =======================================================================
-- name: "Phase 1: Provision Dockhand VM via Proxmox API"
+- name: "Phase 1: Provision Dockhand VM"
   hosts: proxmox
   gather_facts: false
   vars:
     pve_node: "pve"
     template_id: 9000
     vm_name: "dockhand-server"
-    ip_subnet_filter: "20\\.0\\.0\\." # Matches the subnet used in your K3s playbook
+    ip_subnet_filter: "20\\.0\\.0\\." # Your network range
 
   tasks:
     - name: "1. API: Get Next Available VMID"
@@ -37,7 +37,7 @@
         newid: "{{ start_id }}"
         name: "{{ vm_name }}"
         full: true
-        agent: 1
+        agent: yes # Enable agent support
         state: present
         timeout: 600
       delegate_to: localhost
@@ -53,7 +53,9 @@
         update: true
         ciuser: "{{ vm_user }}"
         cipassword: "{{ vm_password }}"
-        ipconfig0: "ip=dhcp"
+        # FIXED: community.general expects a dictionary for ipconfig
+        ipconfig:
+          ipconfig0: "ip=dhcp"
       delegate_to: localhost
 
     - name: "5. API: Start VM"
@@ -67,136 +69,125 @@
         state: started
       delegate_to: localhost
 
-    - name: "6. API: Discover IP Address via QEMU Agent"
+    - name: "6. API: Discover IP Address"
       ansible.builtin.uri:
         url: "https://{{ ansible_host }}:8006/api2/json/nodes/{{ pve_node }}/qemu/{{ start_id }}/agent/network-get-interfaces"
         method: GET
         headers: { Authorization: "PVEAPIToken={{ proxmox_token_id }}={{ proxmox_token_secret }}" }
         validate_certs: false
       register: vm_interfaces_api
-      # Polls the API until an IP matching the 20.0.0.X subnet is populated by the guest agent
       until: "vm_interfaces_api.json.data.result | default([]) | selectattr('name', 'ne', 'lo') | map(attribute='ip-addresses') | flatten | select('search', ip_subnet_filter) | list | length > 0"
-      retries: 50
+      retries: 60
       delay: 5
       delegate_to: localhost
 
     - name: "7. Inventory Assignment"
       ansible.builtin.add_host:
-        name: "{{ vm_name }}"
+        name: "provisioned_dockhand_vm"
         ansible_host: "{{ (vm_interfaces_api.json.data.result | selectattr('name', 'ne', 'lo') | map(attribute='ip-addresses') | flatten | select('search', ip_subnet_filter) | first)['ip-address'] }}"
         ansible_user: "{{ vm_user }}"
         ansible_password: "{{ vm_password }}"
         ansible_become_password: "{{ vm_password }}"
-        groups: ["dockhand_node"]
+        groups: ["dockhand_group"]
         target_vmid: "{{ start_id }}"
       delegate_to: localhost
 
 # =======================================================================
-# PHASE 2: SOFTWARE STACK (DOCKER, UFW, DOCKHAND)
+# PHASE 2: CONFIGURATION & SUMMARY
 # =======================================================================
-- name: "Phase 2: Configuration & Lockdown"
-  hosts: dockhand_node
+- name: "Phase 2: Setup Docker & Firewall"
+  hosts: provisioned_dockhand_vm
   gather_facts: true
   become: true
   vars:
     ansible_ssh_common_args: '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
 
   tasks:
-    - name: "8. Wait for SSH"
+    - name: "8. Wait for SSH Connectivity"
       ansible.builtin.wait_for_connection:
-        timeout: 180
+        timeout: 120
 
-    - name: "9. Install Prerequisites"
-      ansible.builtin.apt:
-        name: [ufw, curl, wget, iptables]
-        state: present
-        update_cache: yes
+    - name: "9. System Setup (Docker & Security)"
+      block:
+        - name: Install Packages
+          ansible.builtin.apt:
+            name: [ufw, curl, wget, iptables]
+            state: present
+            update_cache: yes
 
-    - name: "10. Install Docker"
-      ansible.builtin.shell: "curl -fsSL https://get.docker.com | sh"
-      args:
-        creates: /usr/bin/docker
+        - name: Install Docker
+          ansible.builtin.shell: "curl -fsSL https://get.docker.com | sh"
+          args: { creates: /usr/bin/docker }
 
-    - name: "11. Enable Non-Sudo Docker for User"
-      ansible.builtin.user:
-        name: "{{ ansible_user }}"
-        groups: docker
-        append: yes
+        - name: Configure User Group
+          ansible.builtin.user:
+            name: "{{ ansible_user }}"
+            groups: docker
+            append: yes
 
-    - name: "12. Install ufw-docker"
-      ansible.builtin.get_url:
-        url: https://github.com/chaifeng/ufw-docker/raw/master/ufw-docker
-        dest: /usr/local/bin/ufw-docker
-        mode: '0755'
+        - name: Install ufw-docker
+          ansible.builtin.get_url:
+            url: https://github.com/chaifeng/ufw-docker/raw/master/ufw-docker
+            dest: /usr/local/bin/ufw-docker
+            mode: '0755'
 
-    - name: "13. Initialize ufw-docker"
-      ansible.builtin.command: /usr/local/bin/ufw-docker install
-      changed_when: false
+        - name: Initialize ufw-docker
+          ansible.builtin.command: /usr/local/bin/ufw-docker install
+          changed_when: false
 
-    - name: "14. Ensure Dockhand data directory exists"
-      ansible.builtin.file:
-        path: /opt/dockhand
-        state: directory
-        mode: '0755'
-
-    - name: "15. Deploy Dockhand Container"
+    - name: "10. Deploy Dockhand"
       community.docker.docker_container:
         name: dockhand
         image: fnsys/dockhand:latest
         restart_policy: unless-stopped
         state: started
-        published_ports:
-          - "8080:3000"
+        published_ports: ["8080:3000"]
         volumes:
           - /var/run/docker.sock:/var/run/docker.sock
           - /opt/dockhand:/app/data
-        env:
-          HOST_DATA_DIR: "/opt/dockhand"
-      register: dockhand_container
+        env: { HOST_DATA_DIR: "/opt/dockhand" }
+      register: dockhand_info
 
-    - name: "16. Reset UFW"
-      community.general.ufw:
-        state: reset
+    - name: "11. Apply Firewall Lockdown"
+      block:
+        - name: Reset & Default Deny
+          community.general.ufw: { state: reset }
+        
+        - name: Set Policies
+          community.general.ufw:
+            direction: "{{ item.dir }}"
+            policy: "{{ item.policy }}"
+          loop:
+            - { dir: 'incoming', policy: 'deny' }
+            - { dir: 'outgoing', policy: 'allow' }
+            - { dir: 'routed', policy: 'deny' }
 
-    - name: "17. Set default UFW policies"
-      community.general.ufw:
-        direction: "{{ item.dir }}"
-        policy: "{{ item.policy }}"
-      loop:
-        - { dir: 'incoming', policy: 'deny' }
-        - { dir: 'outgoing', policy: 'allow' }
-        - { dir: 'routed', policy: 'deny' }
+        - name: Allow Admin SSH
+          community.general.ufw:
+            rule: allow
+            from_ip: "{{ ssh_ip }}"
+            port: '22'
+            proto: tcp
 
-    - name: "18. UFW - Allow Admin SSH"
-      community.general.ufw:
-        rule: allow
-        from_ip: "{{ ssh_ip }}"
-        port: '22'
-        proto: tcp
-        comment: 'SSH - admin IP only'
+        - name: UFW-Docker Routing Rule
+          ansible.builtin.command: >
+            ufw route allow proto tcp 
+            from {{ ssh_ip }} 
+            to {{ dockhand_info.container.NetworkSettings.IPAddress }} port 3000
 
-    - name: "19. UFW-Docker - Route Allow Dockhand"
-      ansible.builtin.command: >
-        ufw route allow proto tcp 
-        from {{ ssh_ip }} 
-        to {{ dockhand_container.container.NetworkSettings.IPAddress }} port 3000
-      
-    - name: "20. Enable UFW"
-      community.general.ufw:
-        state: enabled
+        - name: Enable UFW
+          community.general.ufw: { state: enabled }
 
-    - name: "21. Final Access Summary"
+    - name: "12. Final Access Summary"
       ansible.builtin.debug:
         msg:
-          - "================================================================"
-          - "       SUCCESS: Infrastructure Ready & Strictly Locked Down     "
-          - "================================================================"
-          - "VM ID          : {{ target_vmid }}"
-          - "Server IP      : {{ ansible_host }}"
-          - "Admin IP       : {{ ssh_ip }}"
-          - "Container IP   : {{ dockhand_container.container.NetworkSettings.IPAddress }}:3000"
           - "----------------------------------------------------------------"
-          - "SSH Access     : ssh {{ ansible_user }}@{{ ansible_host }} (Port 22 -> Admin IP only)"
-          - "Dockhand URL   : http://{{ ansible_host }}:8080 (Admin IP only)"
-          - "All other inbound + forwarded traffic is DENIED."
-          - "================================================================"
+          - "INFRASTRUCTURE DEPLOYMENT COMPLETE"
+          - "----------------------------------------------------------------"
+          - "VM ID        : {{ hostvars['provisioned_dockhand_vm']['target_vmid'] }}"
+          - "Server IP    : {{ ansible_host }}"
+          - "Whitelisted IP: {{ ssh_ip }}"
+          - "Dockhand URL : http://{{ ansible_host }}:8080"
+          - "----------------------------------------------------------------"
+          - "All traffic except SSH and Dockhand from {{ ssh_ip }} is blocked."
+          - "----------------------------------------------------------------"
