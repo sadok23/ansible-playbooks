@@ -1,198 +1,260 @@
 ---
-# =======================================================================
-# PHASE 1: INFRASTRUCTURE PROVISIONING (PROXMOX API)
-# =======================================================================
-- name: "Phase 1: Provision Dockhand VM"
+# ┌──────────────────────────────────────────────────────────────────────────┐
+# │  Semaphore Variable Group — add these keys:                              │
+# │    new_vm_name   →  dockhand-node                                        │
+# │    vm_user       →  devops                                               │
+# │    vm_password   →  YourSecurePass!          (mark as secret)            │
+# │    ssh_ip        →  192.168.1.10                                         │
+# └──────────────────────────────────────────────────────────────────────────┘
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PLAY 1 — Proxmox: clone template 9000, configure cloud-init, start VM
+# ══════════════════════════════════════════════════════════════════════════════
+- name: "Provision VM from Proxmox template"
   hosts: proxmox
   gather_facts: false
   vars:
-    pve_node: "pve"
-    template_id: 9000
-    vm_name: "dockhand-server"
-    ip_subnet_filter: "20\\.0\\.0\\." # Your network range
+    pve_api:      "https://{{ ansible_host }}:8006/api2/json"
+    pve_token:    "PVEAPIToken={{ proxmox_token_id }}={{ proxmox_token_secret }}"
+    proxmox_node: "pve"
 
   tasks:
-    - name: "1. API: Get Next Available VMID"
+
+    - name: "1. Get next available VMID"
       ansible.builtin.uri:
-        url: "https://{{ ansible_host }}:8006/api2/json/cluster/nextid"
+        url: "{{ pve_api }}/cluster/nextid"
         method: GET
-        headers: { Authorization: "PVEAPIToken={{ proxmox_token_id }}={{ proxmox_token_secret }}" }
+        headers:
+          Authorization: "{{ pve_token }}"
         validate_certs: false
       register: next_vmid_api
       delegate_to: localhost
 
-    - name: "2. Set Starting VMID Fact"
+    - name: "2. Set VMID fact"
       ansible.builtin.set_fact:
-        start_id: "{{ next_vmid_api.json.data | int }}"
+        resolved_vm_id: "{{ next_vmid_api.json.data | int }}"
 
-    - name: "3. API: Clone VM"
+    - name: "3. Clone template 9000 → VMID {{ resolved_vm_id }}"
       community.general.proxmox_kvm:
-        api_host: "{{ ansible_host }}"
-        api_user: "{{ proxmox_token_id.split('!')[0] }}"
-        api_token_id: "{{ proxmox_token_id.split('!')[1] }}"
+        api_host:         "{{ ansible_host }}"
+        api_user:         "{{ proxmox_token_id.split('!')[0] }}"
+        api_token_id:     "{{ proxmox_token_id.split('!')[1] }}"
         api_token_secret: "{{ proxmox_token_secret }}"
-        node: "{{ pve_node }}"
-        vmid: "{{ template_id }}"
-        clone: "{{ template_id }}"
-        newid: "{{ start_id }}"
-        name: "{{ vm_name }}"
-        full: true
-        agent: yes # Enable agent support
-        state: present
-        timeout: 600
+        node:             "{{ proxmox_node }}"
+        vmid:             9000
+        clone:            9000
+        newid:            "{{ resolved_vm_id }}"
+        name:             "{{ new_vm_name }}"
+        full:             true
+        agent:            1
+        state:            present
+        timeout:          600
       delegate_to: localhost
 
-    - name: "4. API: Configure Cloud-Init (Credentials & DHCP)"
-      community.general.proxmox_kvm:
-        api_host: "{{ ansible_host }}"
-        api_user: "{{ proxmox_token_id.split('!')[0] }}"
-        api_token_id: "{{ proxmox_token_id.split('!')[1] }}"
-        api_token_secret: "{{ proxmox_token_secret }}"
-        node: "{{ pve_node }}"
-        vmid: "{{ start_id }}"
-        update: true
-        ciuser: "{{ vm_user }}"
-        cipassword: "{{ vm_password }}"
-        ipconfig:
-          ipconfig0: "ip=dhcp"
-      delegate_to: localhost
-      # --- RETRY LOGIC STARTS HERE ---
-      register: update_result
-      until: update_result is not failed
-      retries: 10
-      delay: 5
-      # -------------------------------
-
-    - name: "5. API: Start VM"
-      community.general.proxmox_kvm:
-        api_host: "{{ ansible_host }}"
-        api_user: "{{ proxmox_token_id.split('!')[0] }}"
-        api_token_id: "{{ proxmox_token_id.split('!')[1] }}"
-        api_token_secret: "{{ proxmox_token_secret }}"
-        node: "{{ pve_node }}"
-        vmid: "{{ start_id }}"
-        state: started
-      delegate_to: localhost
-
-    - name: "6. API: Discover IP Address"
+    - name: "4. Set cloud-init — user / password / DHCP"
       ansible.builtin.uri:
-        url: "https://{{ ansible_host }}:8006/api2/json/nodes/{{ pve_node }}/qemu/{{ start_id }}/agent/network-get-interfaces"
+        url: "{{ pve_api }}/nodes/{{ proxmox_node }}/qemu/{{ resolved_vm_id }}/config"
+        method: PUT
+        headers:
+          Authorization: "{{ pve_token }}"
+        body_format: form-urlencoded
+        body:
+          ciuser:     "{{ vm_user }}"
+          cipassword: "{{ vm_password }}"
+          ipconfig0:  "ip=dhcp"
+        validate_certs: false
+        status_code: 200
+      delegate_to: localhost
+
+    - name: "5. Start VM {{ resolved_vm_id }}"
+      community.general.proxmox_kvm:
+        api_host:         "{{ ansible_host }}"
+        api_user:         "{{ proxmox_token_id.split('!')[0] }}"
+        api_token_id:     "{{ proxmox_token_id.split('!')[1] }}"
+        api_token_secret: "{{ proxmox_token_secret }}"
+        node:             "{{ proxmox_node }}"
+        vmid:             "{{ resolved_vm_id }}"
+        state:            started
+      delegate_to: localhost
+
+    - name: "6. Wait — let cloud-init finish and QEMU agent come up"
+      ansible.builtin.pause:
+        seconds: 30
+
+    - name: "7. Discover VM IP via QEMU guest agent"
+      ansible.builtin.uri:
+        url: "{{ pve_api }}/nodes/{{ proxmox_node }}/qemu/{{ resolved_vm_id }}/agent/network-get-interfaces"
         method: GET
-        headers: { Authorization: "PVEAPIToken={{ proxmox_token_id }}={{ proxmox_token_secret }}" }
+        headers:
+          Authorization: "{{ pve_token }}"
         validate_certs: false
       register: vm_interfaces_api
-      until: "vm_interfaces_api.json.data.result | default([]) | selectattr('name', 'ne', 'lo') | map(attribute='ip-addresses') | flatten | select('search', ip_subnet_filter) | list | length > 0"
-      retries: 60
+      until: >
+        vm_interfaces_api.json.data.result
+        | selectattr('name', 'ne', 'lo')
+        | map(attribute='ip-addresses')
+        | flatten
+        | selectattr('ip-address-type', 'eq', 'ipv4')
+        | list | length > 0
+      retries: 50
       delay: 5
       delegate_to: localhost
 
-    - name: "7. Inventory Assignment"
-      ansible.builtin.add_host:
-        name: "provisioned_dockhand_vm"
-        ansible_host: "{{ (vm_interfaces_api.json.data.result | selectattr('name', 'ne', 'lo') | map(attribute='ip-addresses') | flatten | select('search', ip_subnet_filter) | first)['ip-address'] }}"
-        ansible_user: "{{ vm_user }}"
-        ansible_password: "{{ vm_password }}"
-        ansible_become_password: "{{ vm_password }}"
-        groups: ["dockhand_group"]
-        target_vmid: "{{ start_id }}"
-      delegate_to: localhost
+    - name: "8. Extract VM IP fact"
+      ansible.builtin.set_fact:
+        discovered_vm_ip: >-
+          {{
+            vm_interfaces_api.json.data.result
+            | selectattr('name', 'ne', 'lo')
+            | map(attribute='ip-addresses')
+            | flatten
+            | selectattr('ip-address-type', 'eq', 'ipv4')
+            | map(attribute='ip-address')
+            | first
+          }}
 
-# =======================================================================
-# PHASE 2: CONFIGURATION & SUMMARY
-# =======================================================================
-- name: "Phase 2: Setup Docker & Firewall"
-  hosts: provisioned_dockhand_vm
-  gather_facts: true
-  become: true
-  vars:
-    ansible_ssh_common_args: '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null'
+    - name: "9. Print discovered IP"
+      ansible.builtin.debug:
+        msg: "VM {{ resolved_vm_id }} is live at {{ discovered_vm_ip }}"
+
+    - name: "10. Add new VM to in-memory inventory"
+      ansible.builtin.add_host:
+        name:                   "new_vm"
+        ansible_host:           "{{ discovered_vm_ip }}"
+        ansible_user:           "{{ vm_user }}"
+        ansible_password:       "{{ vm_password }}"
+        ansible_become:         true
+        ansible_become_method:  sudo
+        ansible_become_pass:    "{{ vm_password }}"
+        ansible_ssh_extra_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+        fwd_ssh_ip:             "{{ ssh_ip }}"
+        fwd_vm_user:            "{{ vm_user }}"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PLAY 2 — New VM: wait for SSH, write + run setup script, clean up
+# ══════════════════════════════════════════════════════════════════════════════
+- name: "Bootstrap new VM"
+  hosts: new_vm
+  gather_facts: false
 
   tasks:
-    - name: "8. Wait for SSH Connectivity"
+
+    - name: "11. Wait for SSH to become available"
       ansible.builtin.wait_for_connection:
-        timeout: 120
+        delay:   20
+        timeout: 300
 
-    - name: "9. System Setup (Docker & Security)"
-      block:
-        - name: Install Packages
-          ansible.builtin.apt:
-            name: [ufw, curl, wget, iptables]
-            state: present
-            update_cache: yes
+    - name: "12. Gather facts"
+      ansible.builtin.setup:
 
-        - name: Install Docker
-          ansible.builtin.shell: "curl -fsSL https://get.docker.com | sh"
-          args: { creates: /usr/bin/docker }
+    - name: "13. Write setup script to /tmp/setup.sh"
+      ansible.builtin.copy:
+        dest:    /tmp/setup.sh
+        mode:    "0700"
+        content: |
+          #!/bin/bash
+          set -e
 
-        - name: Configure User Group
-          ansible.builtin.user:
-            name: "{{ ansible_user }}"
-            groups: docker
-            append: yes
+          # ── Variables injected by Ansible ──────────────────────────────────
+          SSH_IP="{{ fwd_ssh_ip }}"
+          ACTUAL_USER="{{ fwd_vm_user }}"
 
-        - name: Install ufw-docker
-          ansible.builtin.get_url:
-            url: https://github.com/chaifeng/ufw-docker/raw/master/ufw-docker
-            dest: /usr/local/bin/ufw-docker
-            mode: '0755'
+          echo "--- Admin IP  : $SSH_IP ---"
+          echo "--- Setup for : $ACTUAL_USER ---"
 
-        - name: Initialize ufw-docker
-          ansible.builtin.command: /usr/local/bin/ufw-docker install
-          changed_when: false
+          # ── 1. Prerequisites ───────────────────────────────────────────────
+          apt-get update -qq
+          apt-get install -y ufw curl wget iptables
 
-    - name: "10. Deploy Dockhand"
-      community.docker.docker_container:
-        name: dockhand
-        image: fnsys/dockhand:latest
-        restart_policy: unless-stopped
-        state: started
-        published_ports: ["8080:3000"]
-        volumes:
-          - /var/run/docker.sock:/var/run/docker.sock
-          - /opt/dockhand:/app/data
-        env: { HOST_DATA_DIR: "/opt/dockhand" }
-      register: dockhand_info
+          # ── 2. Docker ──────────────────────────────────────────────────────
+          echo "--- Installing Docker Engine ---"
+          curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
+          sh /tmp/get-docker.sh
+          rm /tmp/get-docker.sh
 
-    - name: "11. Apply Firewall Lockdown"
-      block:
-        - name: Reset & Default Deny
-          community.general.ufw: { state: reset }
-        
-        - name: Set Policies
-          community.general.ufw:
-            direction: "{{ item.dir }}"
-            policy: "{{ item.policy }}"
-          loop:
-            - { dir: 'incoming', policy: 'deny' }
-            - { dir: 'outgoing', policy: 'allow' }
-            - { dir: 'routed', policy: 'deny' }
+          echo "--- Adding $ACTUAL_USER to docker group ---"
+          groupadd -f docker || true
+          usermod -aG docker "$ACTUAL_USER"
 
-        - name: Allow Admin SSH
-          community.general.ufw:
-            rule: allow
-            from_ip: "{{ ssh_ip }}"
-            port: '22'
-            proto: tcp
+          # ── 3. ufw-docker (BEFORE enabling UFW) ───────────────────────────
+          echo "--- Installing ufw-docker ---"
+          wget -qO /usr/local/bin/ufw-docker \
+            https://github.com/chaifeng/ufw-docker/raw/master/ufw-docker
+          chmod +x /usr/local/bin/ufw-docker
+          /usr/local/bin/ufw-docker install
 
-        - name: UFW-Docker Routing Rule
-          ansible.builtin.command: >
-            ufw route allow proto tcp 
-            from {{ ssh_ip }} 
-            to {{ dockhand_info.container.NetworkSettings.IPAddress }} port 3000
+          # ── 4. Deploy Dockhand ─────────────────────────────────────────────
+          echo "--- Deploying Dockhand ---"
+          mkdir -p /opt/dockhand
+          docker rm -f dockhand 2>/dev/null || true
 
-        - name: Enable UFW
-          community.general.ufw: { state: enabled }
+          docker run -d \
+            --name dockhand \
+            --restart unless-stopped \
+            -p 8080:3000 \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v /opt/dockhand:/app/data \
+            -e HOST_DATA_DIR=/opt/dockhand \
+            fnsys/dockhand:latest
 
-    - name: "12. Final Access Summary"
+          CONTAINER_IP=$(docker inspect \
+            -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' dockhand)
+
+          if [ -z "$CONTAINER_IP" ]; then
+            echo "Error: Could not resolve Dockhand container IP."
+            docker logs dockhand
+            exit 1
+          fi
+
+          echo "--- Dockhand container IP: $CONTAINER_IP ---"
+
+          # ── 5. Configure UFW ───────────────────────────────────────────────
+          echo "--- Configuring UFW ---"
+          ufw --force reset
+          ufw default deny incoming
+          ufw default allow outgoing
+          ufw default deny routed
+
+          ufw allow from "$SSH_IP" to any port 22 proto tcp \
+            comment 'SSH - admin IP only'
+
+          ufw route allow proto tcp \
+            from "$SSH_IP" to "$CONTAINER_IP" port 3000 \
+            comment 'Dockhand route - admin IP only'
+
+          ufw --force enable
+          ufw reload
+
+          # ── Persist admin IP ───────────────────────────────────────────────
+          cat > /etc/ufw-admin-ip.conf <<EOF
+          # Written by Ansible provision on $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          ADMIN_IP=$SSH_IP
+          EOF
+
+          # ── Summary ────────────────────────────────────────────────────────
+          SERVER_IP=$(hostname -I | awk '{print $1}')
+          echo "----------------------------------------------------------------"
+          echo "SUCCESS"
+          echo "  Admin IP    : $SSH_IP"
+          echo "  SSH         : port 22                → admin IP only"
+          echo "  Dockhand    : http://$SERVER_IP:8080  → admin IP only"
+          echo "  Container   : $CONTAINER_IP:3000"
+          echo "----------------------------------------------------------------"
+          ufw status verbose
+          ufw-docker status
+      become: false
+
+    - name: "14. Run setup script"
+      ansible.builtin.command: /tmp/setup.sh
+      become: true
+      register: setup_output
+
+    - name: "15. Remove setup script"
+      ansible.builtin.file:
+        path:  /tmp/setup.sh
+        state: absent
+      become: true
+
+    - name: "16. Print setup output"
       ansible.builtin.debug:
-        msg:
-          - "----------------------------------------------------------------"
-          - "INFRASTRUCTURE DEPLOYMENT COMPLETE"
-          - "----------------------------------------------------------------"
-          - "VM ID        : {{ hostvars['provisioned_dockhand_vm']['target_vmid'] }}"
-          - "Server IP    : {{ ansible_host }}"
-          - "Whitelisted IP: {{ ssh_ip }}"
-          - "Dockhand URL : http://{{ ansible_host }}:8080"
-          - "----------------------------------------------------------------"
-          - "All traffic except SSH and Dockhand from {{ ssh_ip }} is blocked."
-          - "----------------------------------------------------------------"
+        msg: "{{ setup_output.stdout_lines }}"
