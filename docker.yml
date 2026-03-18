@@ -3,27 +3,22 @@
 # │  Semaphore Variable Group (Extra Variables — JSON):                      │
 # │  {                                                                       │
 # │    "new_vm_name": "dockhand-node",                                       │
-# │    "vm_user":     "devops",                                              │
-# │    "vm_password": "YourSecurePass!",                                     │
-# │    "ssh_ip":      "192.168.1.10"                                         │
+# │    "vm_user":     "astro",                                               │
+# │    "vm_password": "root",                                                │
+# │    "ssh_ip":      "20.0.0.84"                                            │
 # │  }                                                                       │
 # └──────────────────────────────────────────────────────────────────────────┘
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PLAY 1 — Proxmox: create VM, import disk, configure, start, discover IP
+# PLAY 1 — Proxmox: clone, configure, start, bootstrap OS, discover IP
 # ══════════════════════════════════════════════════════════════════════════════
-- name: "Provision VM from Jammy image"
+- name: "Provision VM from Proxmox template"
   hosts: proxmox
   gather_facts: false
   vars:
     pve_api:      "https://{{ ansible_host }}:8006/api2/json"
     pve_token:    "PVEAPIToken={{ proxmox_token_id }}={{ proxmox_token_secret }}"
     proxmox_node: "pve"
-    storage:      "zfe1_pve3"
-    jammy_image:  "/var/lib/vz/template/iso/jammy-server-cloudimg-amd64.img"
-    vm_cpu:       2
-    vm_ram:       2048
-    vm_disk:      "20G"
 
   tasks:
 
@@ -41,67 +36,24 @@
       ansible.builtin.set_fact:
         resolved_vm_id: "{{ next_vmid_api.json.data | int }}"
 
-    - name: "3. Create VM {{ resolved_vm_id }}"
-      ansible.builtin.uri:
-        url: "{{ pve_api }}/nodes/{{ proxmox_node }}/qemu"
-        method: POST
-        headers:
-          Authorization: "{{ pve_token }}"
-        body_format: form-urlencoded
-        body:
-          vmid:    "{{ resolved_vm_id }}"
-          name:    "{{ new_vm_name }}"
-          cores:   "{{ vm_cpu }}"
-          memory:  "{{ vm_ram }}"
-          net0:    "virtio,bridge=vmbr0"
-          ostype:  l26
-        validate_certs: false
-        status_code: 200
+    - name: "3. Clone template 9001 → VMID {{ resolved_vm_id }}"
+      community.general.proxmox_kvm:
+        api_host:         "{{ ansible_host }}"
+        api_user:         "{{ proxmox_token_id.split('!')[0] }}"
+        api_token_id:     "{{ proxmox_token_id.split('!')[1] }}"
+        api_token_secret: "{{ proxmox_token_secret }}"
+        node:             "{{ proxmox_node }}"
+        vmid:             9001
+        clone:            9001
+        newid:            "{{ resolved_vm_id }}"
+        name:             "{{ new_vm_name }}"
+        full:             true
+        agent:            1
+        state:            present
+        timeout:          600
       delegate_to: localhost
 
-    - name: "4. Import Jammy disk into {{ storage }}"
-      ansible.builtin.command: >
-        qm importdisk {{ resolved_vm_id }}
-        {{ jammy_image }}
-        {{ storage }}
-        --format qcow2
-      register: importdisk_out
-      changed_when: true
-
-    - name: "5. Configure VM hardware + cloud-init drive"
-      ansible.builtin.uri:
-        url: "{{ pve_api }}/nodes/{{ proxmox_node }}/qemu/{{ resolved_vm_id }}/config"
-        method: PUT
-        headers:
-          Authorization: "{{ pve_token }}"
-        body_format: form-urlencoded
-        body:
-          scsihw:  "virtio-scsi-pci"
-          scsi0:   "{{ storage }}:vm-{{ resolved_vm_id }}-disk-0,discard=on"
-          ide2:    "{{ storage }}:cloudinit"
-          boot:    "order=scsi0"
-          serial0: "socket"
-          vga:     "serial0"
-          agent:   "enabled=1"
-        validate_certs: false
-        status_code: 200
-      delegate_to: localhost
-
-    - name: "6. Resize disk to {{ vm_disk }}"
-      ansible.builtin.uri:
-        url: "{{ pve_api }}/nodes/{{ proxmox_node }}/qemu/{{ resolved_vm_id }}/resize"
-        method: PUT
-        headers:
-          Authorization: "{{ pve_token }}"
-        body_format: form-urlencoded
-        body:
-          disk: "scsi0"
-          size: "{{ vm_disk }}"
-        validate_certs: false
-        status_code: 200
-      delegate_to: localhost
-
-    - name: "7. Set cloud-init — user / password / DHCP"
+    - name: "4. Set cloud-init — user / password / DHCP"
       ansible.builtin.uri:
         url: "{{ pve_api }}/nodes/{{ proxmox_node }}/qemu/{{ resolved_vm_id }}/config"
         method: PUT
@@ -116,17 +68,18 @@
         status_code: 200
       delegate_to: localhost
 
-    - name: "8. Start VM {{ resolved_vm_id }}"
-      ansible.builtin.uri:
-        url: "{{ pve_api }}/nodes/{{ proxmox_node }}/qemu/{{ resolved_vm_id }}/status/start"
-        method: POST
-        headers:
-          Authorization: "{{ pve_token }}"
-        validate_certs: false
-        status_code: 200
+    - name: "5. Start VM {{ resolved_vm_id }}"
+      community.general.proxmox_kvm:
+        api_host:         "{{ ansible_host }}"
+        api_user:         "{{ proxmox_token_id.split('!')[0] }}"
+        api_token_id:     "{{ proxmox_token_id.split('!')[1] }}"
+        api_token_secret: "{{ proxmox_token_secret }}"
+        node:             "{{ proxmox_node }}"
+        vmid:             "{{ resolved_vm_id }}"
+        state:            started
       delegate_to: localhost
 
-    - name: "9. Configure user + enable SSH password auth via QEMU agent"
+    - name: "6. Configure user + enable SSH password auth via QEMU agent"
       ansible.builtin.uri:
         url: "{{ pve_api }}/nodes/{{ proxmox_node }}/qemu/{{ resolved_vm_id }}/agent/exec"
         method: POST
@@ -138,31 +91,13 @@
             - "bash"
             - "-c"
             - |
-              # Ensure user exists with valid shell
               id {{ vm_user }} &>/dev/null || useradd -m -s /bin/bash {{ vm_user }}
-              usermod -s /bin/bash {{ vm_user }}
-
-              # Set password
               echo "{{ vm_user }}:{{ vm_password }}" | chpasswd
-
-              # Grant passwordless sudo
               echo '{{ vm_user }} ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/{{ vm_user }}
               chmod 440 /etc/sudoers.d/{{ vm_user }}
-
-              # Enable SSH password authentication
               sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
-              echo "PasswordAuthentication yes" > /etc/ssh/sshd_config.d/99-ansible.conf
-
-              # Remove nologin lockfiles
-              rm -f /etc/nologin /run/nologin
-
-              # Restart SSH
-              systemctl restart ssh
-
-              # Regenerate machine-id
-              rm -f /etc/machine-id
-              systemd-machine-id-setup
-
+              sed -i 's/^#*KbdInteractiveAuthentication.*/KbdInteractiveAuthentication yes/' /etc/ssh/sshd_config
+              systemctl restart ssh || systemctl restart sshd
               reboot
         validate_certs: false
       register: agent_exec
@@ -171,11 +106,11 @@
       delay: 5
       delegate_to: localhost
 
-    - name: "10. Wait for reboot to complete"
+    - name: "7. Wait for reboot to complete"
       ansible.builtin.pause:
-        seconds: 30
+        seconds: 60
 
-    - name: "11. Discover VM IP via QEMU guest agent"
+    - name: "8. Discover VM IP via QEMU guest agent"
       ansible.builtin.uri:
         url: "{{ pve_api }}/nodes/{{ proxmox_node }}/qemu/{{ resolved_vm_id }}/agent/network-get-interfaces"
         method: GET
@@ -194,7 +129,7 @@
       delay: 5
       delegate_to: localhost
 
-    - name: "12. Extract VM IP fact"
+    - name: "9. Extract VM IP fact"
       ansible.builtin.set_fact:
         discovered_vm_ip: >-
           {{
@@ -207,11 +142,11 @@
             | first
           }}
 
-    - name: "13. Print discovered IP"
+    - name: "10. Print discovered IP"
       ansible.builtin.debug:
         msg: "VM {{ resolved_vm_id }} is live at {{ discovered_vm_ip }}"
 
-    - name: "14. Add new VM to in-memory inventory"
+    - name: "11. Add new VM to in-memory inventory"
       ansible.builtin.add_host:
         name:                   "new_vm"
         ansible_host:           "{{ discovered_vm_ip }}"
@@ -233,15 +168,15 @@
 
   tasks:
 
-    - name: "15. Wait for SSH to become available"
+    - name: "12. Wait for SSH to become available"
       ansible.builtin.wait_for_connection:
         delay:   10
         timeout: 300
 
-    - name: "16. Gather facts"
+    - name: "13. Gather facts"
       ansible.builtin.setup:
 
-    - name: "17. Write setup script to /tmp/setup.sh"
+    - name: "14. Write setup script to /tmp/setup.sh"
       ansible.builtin.copy:
         dest:    /tmp/setup.sh
         mode:    "0700"
@@ -291,8 +226,10 @@
             -e HOST_DATA_DIR=/opt/dockhand \
             fnsys/dockhand:latest
 
+          {% raw %}
           CONTAINER_IP=$(docker inspect \
-            -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' dockhand)
+            -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' dockhand)
+          {% endraw %}
 
           if [ -z "$CONTAINER_IP" ]; then
             echo "Error: Could not resolve Dockhand container IP."
@@ -302,15 +239,15 @@
 
           echo "--- Dockhand container IP: $CONTAINER_IP ---"
 
-          # ── 5. Configure UFW ───────────────────────────────────────────────
+          # ── 5. Configure UFW — SSH open during provisioning ────────────────
           echo "--- Configuring UFW ---"
           ufw --force reset
           ufw default deny incoming
           ufw default allow outgoing
           ufw default deny routed
 
-          ufw allow from "$SSH_IP" to any port 22 proto tcp \
-            comment 'SSH - admin IP only'
+          # SSH open temporarily so Ansible can finish
+          ufw allow 22/tcp comment 'SSH - temporary open'
 
           ufw route allow proto tcp \
             from "$SSH_IP" to "$CONTAINER_IP" port 3000 \
@@ -330,25 +267,38 @@
           echo "----------------------------------------------------------------"
           echo "SUCCESS"
           echo "  Admin IP    : $SSH_IP"
-          echo "  SSH         : port 22                → admin IP only"
-          echo "  Dockhand    : http://$SERVER_IP:8080  → admin IP only"
+          echo "  SSH         : port 22 (temporarily open)"
+          echo "  Dockhand    : http://$SERVER_IP:8080 → admin IP only"
           echo "  Container   : $CONTAINER_IP:3000"
           echo "----------------------------------------------------------------"
           ufw status verbose
           ufw-docker status
       become: false
 
-    - name: "18. Run setup script"
+    - name: "15. Run setup script"
       ansible.builtin.command: /tmp/setup.sh
       become: true
       register: setup_output
 
-    - name: "19. Remove setup script"
+    - name: "16. Remove setup script"
       ansible.builtin.file:
         path:  /tmp/setup.sh
         state: absent
       become: true
 
-    - name: "20. Print setup output"
+    - name: "17. Print setup output"
       ansible.builtin.debug:
         msg: "{{ setup_output.stdout_lines }}"
+
+    - name: "18. Lock SSH to admin IP only"
+      ansible.builtin.command: >
+        bash -c "
+        ufw delete allow 22/tcp;
+        ufw allow from {{ fwd_ssh_ip }} to any port 22 proto tcp comment 'SSH - admin IP only';
+        ufw reload
+        "
+      become: true
+
+    - name: "19. Print final SSH lockdown confirmation"
+      ansible.builtin.debug:
+        msg: "SSH is now restricted to {{ fwd_ssh_ip }} only. Provisioning complete."
