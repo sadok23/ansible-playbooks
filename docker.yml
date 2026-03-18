@@ -53,6 +53,20 @@
         timeout:          600
       delegate_to: localhost
 
+    - name: "3b. Wait for cloned VM config to be ready"
+      ansible.builtin.uri:
+        url: "{{ pve_api }}/nodes/{{ proxmox_node }}/qemu/{{ resolved_vm_id }}/config"
+        method: GET
+        headers:
+          Authorization: "{{ pve_token }}"
+        validate_certs: false
+        status_code: 200
+      register: vm_config_check
+      until: vm_config_check.status == 200
+      retries: 20
+      delay: 5
+      delegate_to: localhost
+
     - name: "4. Set cloud-init — user / password / DHCP"
       ansible.builtin.uri:
         url: "{{ pve_api }}/nodes/{{ proxmox_node }}/qemu/{{ resolved_vm_id }}/config"
@@ -77,6 +91,25 @@
         node:             "{{ proxmox_node }}"
         vmid:             "{{ resolved_vm_id }}"
         state:            started
+      delegate_to: localhost
+
+    - name: "5b. Wait for cloud-init to finish via QEMU agent"
+      ansible.builtin.uri:
+        url: "{{ pve_api }}/nodes/{{ proxmox_node }}/qemu/{{ resolved_vm_id }}/agent/exec"
+        method: POST
+        headers:
+          Authorization: "{{ pve_token }}"
+        body_format: json
+        body:
+          command:
+            - "bash"
+            - "-c"
+            - "cloud-init status --wait"
+        validate_certs: false
+      register: ci_wait
+      until: ci_wait.status == 200
+      retries: 60
+      delay: 10
       delegate_to: localhost
 
     - name: "6. Configure user + enable SSH password auth via QEMU agent"
@@ -184,7 +217,6 @@
           #!/bin/bash
           set -e
 
-          # ── Variables injected by Ansible ──────────────────────────────────
           SSH_IP="{{ fwd_ssh_ip }}"
           ACTUAL_USER="{{ fwd_vm_user }}"
 
@@ -205,7 +237,7 @@
           groupadd -f docker || true
           usermod -aG docker "$ACTUAL_USER"
 
-          # ── 3. ufw-docker (BEFORE enabling UFW) ───────────────────────────
+          # ── 3. ufw-docker ──────────────────────────────────────────────────
           echo "--- Installing ufw-docker ---"
           wget -qO /usr/local/bin/ufw-docker \
             https://github.com/chaifeng/ufw-docker/raw/master/ufw-docker
@@ -246,7 +278,6 @@
           ufw default allow outgoing
           ufw default deny routed
 
-          # SSH open temporarily so Ansible can finish
           ufw allow 22/tcp comment 'SSH - temporary open'
 
           ufw route allow proto tcp \
@@ -299,6 +330,6 @@
         "
       become: true
 
-    - name: "19. Print final SSH lockdown confirmation"
+    - name: "19. Print final confirmation"
       ansible.builtin.debug:
         msg: "SSH is now restricted to {{ fwd_ssh_ip }} only. Provisioning complete."
