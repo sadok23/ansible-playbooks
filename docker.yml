@@ -43,8 +43,8 @@
         api_token_id:     "{{ proxmox_token_id.split('!')[1] }}"
         api_token_secret: "{{ proxmox_token_secret }}"
         node:             "{{ proxmox_node }}"
-        vmid:             102
-        clone:            102
+        vmid:             9001
+        clone:            9001
         newid:            "{{ resolved_vm_id }}"
         name:             "{{ new_vm_name }}"
         full:             true
