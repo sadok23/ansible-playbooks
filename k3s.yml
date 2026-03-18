@@ -29,24 +29,22 @@
       ansible.builtin.set_fact:
         start_id: "{{ next_vmid_api.json.data | int }}"
 
-    - name: "3. API: Clone VMs"
+    - name: "3. Clone template 102 → VMID {{ resolved_vm_id }}"
       community.general.proxmox_kvm:
-        api_host: "{{ ansible_host }}"
-        api_user: "{{ proxmox_token_id.split('!')[0] }}"
-        api_token_id: "{{ proxmox_token_id.split('!')[1] }}"
+        api_host:         "{{ ansible_host }}"
+        api_user:         "{{ proxmox_token_id.split('!')[0] }}"
+        api_token_id:     "{{ proxmox_token_id.split('!')[1] }}"
         api_token_secret: "{{ proxmox_token_secret }}"
-        node: "{{ node_name }}"
-        vmid: "{{ template_id }}"
-        clone: "{{ template_id }}"
-        newid: "{{ start_id | int + item | int }}"
-        name: "{{ vm_prefix }}-{{ start_id | int + item | int }}"
-        full: true
-        cores: "{{ vm_cpu }}"
-        memory: "{{ vm_ram }}"
-        agent: 1
-        state: present
-        timeout: 600
-      loop: "{{ range(0, node_count | int) | list }}"
+        node:             "{{ proxmox_node }}"
+        vmid:             102
+        clone:            102
+        newid:            "{{ resolved_vm_id }}"
+        name:             "{{ new_vm_name }}"
+        full:             true
+        agent:            1
+        state:            present
+        timeout:          600
+      loop: "{{ range(0, 1) | list }}"
       loop_control:
         pause: 5
       delegate_to: localhost
