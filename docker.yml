@@ -340,15 +340,12 @@
           # ── 9. UFW rules for existing containers only ──────────────────────
           echo "--- Configuring UFW container rules ---"
 
-          # Traefik — ports 80, 443, 8080 (dashboard) from admin IP only
           ufw route allow proto tcp from "$SSH_IP" to "$TRAEFIK_IP" port 80 \
             comment 'Traefik HTTP - admin IP only'
           ufw route allow proto tcp from "$SSH_IP" to "$TRAEFIK_IP" port 443 \
             comment 'Traefik HTTPS - admin IP only'
           ufw route allow proto tcp from "$SSH_IP" to "$TRAEFIK_IP" port 8080 \
             comment 'Traefik dashboard - admin IP only'
-
-          # Dockhand — port 3000 (internal) from admin IP only
           ufw route allow proto tcp from "$SSH_IP" to "$DOCKHAND_IP" port 3000 \
             comment 'Dockhand - admin IP only'
 
@@ -379,6 +376,10 @@
       ansible.builtin.command: /tmp/setup.sh
       become: true
       register: setup_output
+      ignore_errors: true
+
+    - name: "15b. Reset SSH connection after UFW enable"
+      ansible.builtin.meta: reset_connection
 
     - name: "16. Remove setup script"
       ansible.builtin.file:
