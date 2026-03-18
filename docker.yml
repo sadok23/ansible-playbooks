@@ -36,15 +36,15 @@
       ansible.builtin.set_fact:
         resolved_vm_id: "{{ next_vmid_api.json.data | int }}"
 
-    - name: "3. Clone template 9001 → VMID {{ resolved_vm_id }}"
+    - name: "3. Clone template 102 → VMID {{ resolved_vm_id }}"
       community.general.proxmox_kvm:
         api_host:         "{{ ansible_host }}"
         api_user:         "{{ proxmox_token_id.split('!')[0] }}"
         api_token_id:     "{{ proxmox_token_id.split('!')[1] }}"
         api_token_secret: "{{ proxmox_token_secret }}"
         node:             "{{ proxmox_node }}"
-        vmid:             9001
-        clone:            9001
+        vmid:             102
+        clone:            102
         newid:            "{{ resolved_vm_id }}"
         name:             "{{ new_vm_name }}"
         full:             true
