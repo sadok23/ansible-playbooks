@@ -371,8 +371,8 @@
           echo "  Traefik UI    : http://$SERVER_IP:8081     → admin IP only"
           echo "  Dockhand      : http://$SERVER_IP:8080     → admin IP only"
           echo "----------------------------------------------------------------"
-          ufw status verbose
-          ufw-docker status
+          ufw status verbose || true
+          ufw-docker status || true
       become: false
 
     - name: "15. Run setup script"
