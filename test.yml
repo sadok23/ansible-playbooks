@@ -1,0 +1,120 @@
+# provision_vm.yml
+---
+- name: Provision VM from Noble template
+  hosts: proxmox
+  gather_facts: false
+  vars:
+    vm_name: vm-test
+    vm_memory: 2048
+    vm_cores: 2
+    ssh_public_key: "{{ lookup('file', '~/.ssh/id_ed25519.pub') }}"
+
+  tasks:
+    - name: Get next available VMID
+      ansible.builtin.uri:
+        url: "https://{{ ansible_host }}:8006/api2/json/cluster/nextid"
+        method: GET
+        headers:
+          Authorization: "PVEAPIToken={{ proxmox_token_id }}={{ proxmox_token_secret }}"
+        validate_certs: false
+      register: next_vmid
+
+    - name: Set VMID fact
+      ansible.builtin.set_fact:
+        vm_id: "{{ next_vmid.json.data }}"
+
+    - name: Clone template
+      community.proxmox.proxmox_kvm:
+        api_host: "{{ ansible_host }}"
+        api_token_id: "{{ proxmox_token_id }}"
+        api_token_secret: "{{ proxmox_token_secret }}"
+        node: pve
+        clone: ubuntu-2404-template
+        newid: "{{ vm_id }}"
+        name: "{{ vm_name }}"
+        full: true
+        storage: local-lvm
+        state: present
+
+    - name: Configure cloud-init (DHCP)
+      community.proxmox.proxmox_kvm:
+        api_host: "{{ ansible_host }}"
+        api_token_id: "{{ proxmox_token_id }}"
+        api_token_secret: "{{ proxmox_token_secret }}"
+        node: pve
+        vmid: "{{ vm_id }}"
+        ciuser: ubuntu
+        sshkeys: "{{ ssh_public_key }}"
+        ipconfig:
+          ipconfig0: "ip=dhcp"
+        nameservers: "1.1.1.1"
+        memory: "{{ vm_memory }}"
+        cores: "{{ vm_cores }}"
+        update: true
+
+    - name: Start VM
+      community.proxmox.proxmox_kvm:
+        api_host: "{{ ansible_host }}"
+        api_token_id: "{{ proxmox_token_id }}"
+        api_token_secret: "{{ proxmox_token_secret }}"
+        node: pve
+        vmid: "{{ vm_id }}"
+        state: started
+
+    - name: Wait for guest agent to come up
+      ansible.builtin.uri:
+        url: "https://{{ ansible_host }}:8006/api2/json/nodes/pve/qemu/{{ vm_id }}/agent/network-get-interfaces"
+        method: GET
+        headers:
+          Authorization: "PVEAPIToken={{ proxmox_token_id }}={{ proxmox_token_secret }}"
+        validate_certs: false
+        status_code: [200, 500]
+      register: agent_result
+      until: >
+        agent_result.status == 200 and
+        agent_result.json.data.result |
+        selectattr('name', 'ne', 'lo') |
+        map(attribute='ip-addresses') | flatten |
+        selectattr('ip-address-type', 'eq', 'ipv4') |
+        list | length > 0
+      retries: 20
+      delay: 10
+
+    - name: Extract VM IP
+      ansible.builtin.set_fact:
+        vm_ip: >-
+          {{ agent_result.json.data.result |
+             selectattr('name', 'ne', 'lo') |
+             map(attribute='ip-addresses') | flatten |
+             selectattr('ip-address-type', 'eq', 'ipv4') |
+             map(attribute='ip-address') | first }}
+
+    - name: Show assigned IP
+      ansible.builtin.debug:
+        msg: "VM {{ vm_id }} got IP {{ vm_ip }}"
+
+    - name: Wait for SSH
+      ansible.builtin.wait_for:
+        host: "{{ vm_ip }}"
+        port: 22
+        delay: 5
+        timeout: 120
+
+    - name: Add VM to inventory
+      ansible.builtin.add_host:
+        name: "{{ vm_ip }}"
+        groups: provisioned_vms
+        ansible_user: ubuntu
+        ansible_ssh_common_args: "-o StrictHostKeyChecking=no"
+
+- name: Harden VM
+  hosts: provisioned_vms
+  become: true
+  tasks:
+    - name: Install Docker
+      ansible.builtin.include_role:
+        name: docker
+
+    - name: Apply UFW lockdown
+      ansible.builtin.include_role:
+        name: ufw_lockdown
