@@ -1,3 +1,13 @@
+# ┌──────────────────────────────────────────────────────────────────────────┐
+# │  Semaphore Variable Group (Extra Variables — JSON):                      │
+# │  {                                                                       │
+# │    "node_count":  3,                                                     │
+# │    "vm_user":     "astro",                                               │
+# │    "vm_password": "root",                                                │
+# │    "domain":      "astro.lan"                                            │
+# │  }                                                                       │
+# └──────────────────────────────────────────────────────────────────────────┘
+
 # =======================================================================
 # PHASE 1: INFRASTRUCTURE PROVISIONING (PROXMOX API)
 # =======================================================================
@@ -5,16 +15,14 @@
   hosts: proxmox
   gather_facts: false
   vars:
-    pve_api:          "https://{{ ansible_host }}:8006/api2/json"
-    pve_token:        "PVEAPIToken={{ proxmox_token_id }}={{ proxmox_token_secret }}"
-    proxmox_node:     "pve"
-    node_count:       3
-    template_id:      103
-    vm_prefix:        "k3s-node"
-    vm_cpu:           4
-    vm_ram:           8192
-    vm_disk:          "30G"
-    domain:           "astro.lan"
+    pve_api:      "https://{{ ansible_host }}:8006/api2/json"
+    pve_token:    "PVEAPIToken={{ proxmox_token_id }}={{ proxmox_token_secret }}"
+    proxmox_node: "pve"
+    template_id:  103
+    vm_prefix:    "k3s-node"
+    vm_cpu:       4
+    vm_ram:       8192
+    vm_disk:      "30G"
 
   tasks:
 
@@ -256,20 +264,29 @@
         df -h /
       changed_when: false
 
-    - name: "15. Install K3s master"
+    - name: "15. Wait for apt locks to clear (Noble cloud-init holdover)"
+      ansible.builtin.shell: |
+        while fuser /var/lib/dpkg/lock-frontend \
+                    /var/lib/apt/lists/lock \
+                    /var/cache/apt/archives/lock >/dev/null 2>&1; do
+          sleep 3
+        done
+      changed_when: false
+
+    - name: "16. Install K3s master"
       ansible.builtin.shell: "curl -sfL https://get.k3s.io | sh -s - server --disable traefik"
       when: "'k3s_master' in group_names"
       args:
         creates: /etc/rancher/k3s/k3s.yaml
 
-    - name: "16. Fix kubeconfig permissions"
+    - name: "17. Fix kubeconfig permissions"
       ansible.builtin.shell: |
         chmod 644 /etc/rancher/k3s/k3s.yaml
         grep -q "KUBECONFIG" /home/{{ ansible_user }}/.bashrc || \
           echo "export KUBECONFIG=/etc/rancher/k3s/k3s.yaml" >> /home/{{ ansible_user }}/.bashrc
       when: "'k3s_master' in group_names"
 
-    - name: "17. Join worker nodes"
+    - name: "18. Join worker nodes"
       vars:
         master_ip: "{{ hostvars[groups['k3s_master'][0]].ansible_host }}"
       block:
@@ -286,13 +303,14 @@
             sh -
           when: "'k3s_workers' in group_names"
 
-    - name: "18. Install Helm & system dependencies"
+    - name: "19. Install Helm & system dependencies"
       ansible.builtin.shell: |
+        dpkg --configure -a
         curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
         apt-get update && apt-get install -y open-iscsi nfs-common jq
       when: "'k3s_master' in group_names"
 
-    - name: "19. Add Helm repos"
+    - name: "20. Add Helm repos"
       ansible.builtin.shell: |
         helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
         helm repo add jetstack https://charts.jetstack.io
@@ -301,14 +319,14 @@
       environment: "{{ kube_env }}"
       when: "'k3s_master' in group_names"
 
-    - name: "20. Install ingress-nginx"
+    - name: "21. Install ingress-nginx"
       ansible.builtin.shell: |
         helm upgrade --install ingress-nginx ingress-nginx/ingress-nginx \
           --namespace ingress-nginx --create-namespace
       environment: "{{ kube_env }}"
       when: "'k3s_master' in group_names"
 
-    - name: "21. Wait for ingress-nginx controller & admission webhook"
+    - name: "22. Wait for ingress-nginx controller & admission webhook"
       ansible.builtin.shell: |
         kubectl rollout status deployment/ingress-nginx-controller \
           -n ingress-nginx --timeout=300s
@@ -319,7 +337,7 @@
       environment: "{{ kube_env }}"
       when: "'k3s_master' in group_names"
 
-    - name: "22. Install cert-manager"
+    - name: "23. Install cert-manager"
       ansible.builtin.shell: |
         helm upgrade --install cert-manager jetstack/cert-manager \
           --namespace cert-manager --create-namespace \
@@ -327,12 +345,12 @@
       environment: "{{ kube_env }}"
       when: "'k3s_master' in group_names"
 
-    - name: "23. Set unique Rancher hostname fact"
+    - name: "24. Set unique Rancher hostname fact"
       ansible.builtin.set_fact:
         rancher_hostname: "rancher-{{ cluster_id_tag }}.{{ domain_name }}"
       when: "'k3s_master' in group_names"
 
-    - name: "24. Deploy Rancher (NodePort 30443)"
+    - name: "25. Deploy Rancher (NodePort 30443)"
       ansible.builtin.shell: |
         helm upgrade --install rancher rancher-latest/rancher \
           -n cattle-system --create-namespace \
@@ -345,7 +363,7 @@
       environment: "{{ kube_env }}"
       when: "'k3s_master' in group_names"
 
-    - name: "25. Final access summary"
+    - name: "26. Final access summary"
       ansible.builtin.debug:
         msg:
           - "============================================"
