@@ -329,8 +329,8 @@
 
           ufw route allow proto tcp from "$SSH_IP" to any port 80   comment 'Traefik HTTP - admin IP only'
           ufw route allow proto tcp from "$SSH_IP" to any port 443  comment 'Traefik HTTPS - admin IP only'
-          ufw route allow proto tcp from "$SSH_IP" to any port 8081 comment 'Traefik dashboard - admin IP only'
-          ufw route allow proto tcp from "$SSH_IP" to any port 8080 comment 'Dockhand - admin IP only'
+          ufw route allow proto tcp from "$SSH_IP" to any port 8080 comment 'Traefik dashboard - admin IP only'
+          ufw route allow proto tcp from "$SSH_IP" to any port 3000 comment 'Dockhand - admin IP only'
 
           ufw reload
 
