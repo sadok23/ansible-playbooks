@@ -321,15 +321,16 @@
             -e HOST_DATA_DIR=/opt/dockhand \
             fnsys/dockhand:latest
 
-          # ── 8. UFW rules — host published ports (persistent, drift-proof) ──
-          # Targets host-side ports, not container IPs.
-          # Rules survive container restarts, rebuilds, and IP reassignments.
-          echo "--- Configuring UFW host-port rules ---"
+          # ── 8. UFW rules — route rules via FORWARD chain (persistent, drift-proof) ──
+          # ufw route targets the FORWARD chain via ufw-user-forward,
+          # which runs before ufw-docker's deny rules in DOCKER-USER.
+          # No container IPs — rules survive restarts and IP reassignments.
+          echo "--- Configuring UFW route rules ---"
 
-          ufw allow from "$SSH_IP" to any port 80   proto tcp comment 'Traefik HTTP - admin IP only'
-          ufw allow from "$SSH_IP" to any port 443  proto tcp comment 'Traefik HTTPS - admin IP only'
-          ufw allow from "$SSH_IP" to any port 8081 proto tcp comment 'Traefik dashboard - admin IP only'
-          ufw allow from "$SSH_IP" to any port 8080 proto tcp comment 'Dockhand - admin IP only'
+          ufw route allow proto tcp from "$SSH_IP" to any port 80   comment 'Traefik HTTP - admin IP only'
+          ufw route allow proto tcp from "$SSH_IP" to any port 443  comment 'Traefik HTTPS - admin IP only'
+          ufw route allow proto tcp from "$SSH_IP" to any port 8081 comment 'Traefik dashboard - admin IP only'
+          ufw route allow proto tcp from "$SSH_IP" to any port 8080 comment 'Dockhand - admin IP only'
 
           ufw reload
 
