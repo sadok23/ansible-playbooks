@@ -1,0 +1,865 @@
+---
+# ┌──────────────────────────────────────────────────────────────────────────┐
+# │  Semaphore Variable Group (Extra Variables — JSON):                      │
+# │  {                                                                       │
+# │    "new_vm_name": "dockhand-node",                                       │
+# │    "vm_user":     "astro",                                               │
+# │    "vm_password": "root",                                                │
+# │    "ssh_ip":      "20.0.0.84"                                            │
+# │  }                                                                       │
+# └──────────────────────────────────────────────────────────────────────────┘
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PLAY 1 — Proxmox: clone, configure, start, bootstrap OS, discover IP
+# ══════════════════════════════════════════════════════════════════════════════
+- name: "Provision VM from Proxmox template"
+  hosts: proxmox
+  gather_facts: false
+  vars:
+    pve_api:      "https://{{ ansible_host }}:8006/api2/json"
+    pve_token:    "PVEAPIToken={{ proxmox_token_id }}={{ proxmox_token_secret }}"
+    proxmox_node: "pve"
+    template_id:  103
+
+  tasks:
+
+    - name: "1. Get next available VMID"
+      ansible.builtin.uri:
+        url: "{{ pve_api }}/cluster/nextid"
+        method: GET
+        headers:
+          Authorization: "{{ pve_token }}"
+        validate_certs: false
+      register: next_vmid_api
+      delegate_to: localhost
+
+    - name: "2. Set VMID fact"
+      ansible.builtin.set_fact:
+        resolved_vm_id: "{{ next_vmid_api.json.data | int }}"
+
+    - name: "3. Clone template {{ template_id }} → VMID {{ resolved_vm_id }}"
+      community.general.proxmox_kvm:
+        api_host:         "{{ ansible_host }}"
+        api_user:         "{{ proxmox_token_id.split('!')[0] }}"
+        api_token_id:     "{{ proxmox_token_id.split('!')[1] }}"
+        api_token_secret: "{{ proxmox_token_secret }}"
+        node:             "{{ proxmox_node }}"
+        vmid:             "{{ template_id }}"
+        clone:            "{{ template_id }}"
+        newid:            "{{ resolved_vm_id }}"
+        name:             "{{ new_vm_name }}-{{ resolved_vm_id }}"
+        full:             true
+        agent:            1
+        state:            present
+        timeout:          600
+      loop: "{{ range(0, 1) | list }}"
+      loop_control:
+        pause: 5
+      delegate_to: localhost
+
+    - name: "3b. Wait for cloned VM config to be ready"
+      ansible.builtin.uri:
+        url: "{{ pve_api }}/nodes/{{ proxmox_node }}/qemu/{{ resolved_vm_id }}/config"
+        method: GET
+        headers:
+          Authorization: "{{ pve_token }}"
+        validate_certs: false
+        status_code: 200
+      register: vm_config_check
+      until: vm_config_check.status == 200
+      retries: 20
+      delay: 5
+      delegate_to: localhost
+
+    - name: "4. Set cloud-init — user / password / DHCP"
+      ansible.builtin.uri:
+        url: "{{ pve_api }}/nodes/{{ proxmox_node }}/qemu/{{ resolved_vm_id }}/config"
+        method: PUT
+        headers:
+          Authorization: "{{ pve_token }}"
+        body_format: form-urlencoded
+        body:
+          ciuser:     "{{ vm_user }}"
+          cipassword: "{{ vm_password }}"
+          ipconfig0:  "ip=dhcp"
+        validate_certs: false
+        status_code: 200
+      delegate_to: localhost
+
+    - name: "5. Start VM {{ resolved_vm_id }}"
+      community.general.proxmox_kvm:
+        api_host:         "{{ ansible_host }}"
+        api_user:         "{{ proxmox_token_id.split('!')[0] }}"
+        api_token_id:     "{{ proxmox_token_id.split('!')[1] }}"
+        api_token_secret: "{{ proxmox_token_secret }}"
+        node:             "{{ proxmox_node }}"
+        vmid:             "{{ resolved_vm_id }}"
+        state:            started
+      delegate_to: localhost
+
+    - name: "5b. Wait for cloud-init to finish via QEMU agent"
+      ansible.builtin.uri:
+        url: "{{ pve_api }}/nodes/{{ proxmox_node }}/qemu/{{ resolved_vm_id }}/agent/exec"
+        method: POST
+        headers:
+          Authorization: "{{ pve_token }}"
+        body_format: json
+        body:
+          command:
+            - "bash"
+            - "-c"
+            - "cloud-init status | grep -q 'done' && echo OK || exit 1"
+        validate_certs: false
+        status_code: [200, 500]
+      register: ci_wait
+      until: ci_wait.status == 200
+      retries: 60
+      delay: 10
+      delegate_to: localhost
+
+    - name: "6. Configure user + enable SSH password auth via QEMU agent"
+      ansible.builtin.uri:
+        url: "{{ pve_api }}/nodes/{{ proxmox_node }}/qemu/{{ resolved_vm_id }}/agent/exec"
+        method: POST
+        headers:
+          Authorization: "{{ pve_token }}"
+        body_format: json
+        body:
+          command:
+            - "bash"
+            - "-c"
+            - |
+              id {{ vm_user }} &>/dev/null || useradd -m -s /bin/bash {{ vm_user }}
+              echo "{{ vm_user }}:{{ vm_password }}" | chpasswd
+              echo '{{ vm_user }} ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/{{ vm_user }}
+              chmod 440 /etc/sudoers.d/{{ vm_user }}
+              sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+              sed -i 's/^#*KbdInteractiveAuthentication.*/KbdInteractiveAuthentication yes/' /etc/ssh/sshd_config
+              systemctl restart ssh || systemctl restart sshd
+              reboot
+        validate_certs: false
+      register: agent_exec
+      until: agent_exec.status == 200
+      retries: 50
+      delay: 5
+      delegate_to: localhost
+
+    - name: "7. Wait for reboot to complete"
+      ansible.builtin.pause:
+        seconds: 60
+
+    - name: "8. Discover VM IP via QEMU guest agent"
+      ansible.builtin.uri:
+        url: "{{ pve_api }}/nodes/{{ proxmox_node }}/qemu/{{ resolved_vm_id }}/agent/network-get-interfaces"
+        method: GET
+        headers:
+          Authorization: "{{ pve_token }}"
+        validate_certs: false
+      register: vm_interfaces_api
+      until: >
+        vm_interfaces_api.json.data.result
+        | selectattr('name', 'ne', 'lo')
+        | map(attribute='ip-addresses')
+        | flatten
+        | selectattr('ip-address-type', 'eq', 'ipv4')
+        | list | length > 0
+      retries: 50
+      delay: 5
+      delegate_to: localhost
+
+    - name: "9. Extract VM IP fact"
+      ansible.builtin.set_fact:
+        discovered_vm_ip: >-
+          {{
+            vm_interfaces_api.json.data.result
+            | selectattr('name', 'ne', 'lo')
+            | map(attribute='ip-addresses')
+            | flatten
+            | selectattr('ip-address-type', 'eq', 'ipv4')
+            | map(attribute='ip-address')
+            | first
+          }}
+
+    - name: "10. Print discovered IP"
+      ansible.builtin.debug:
+        msg: "VM {{ resolved_vm_id }} is live at {{ discovered_vm_ip }}"
+
+    - name: "11. Add new VM to in-memory inventory"
+      ansible.builtin.add_host:
+        name:                   "new_vm"
+        ansible_host:           "{{ discovered_vm_ip }}"
+        ansible_user:           "{{ vm_user }}"
+        ansible_password:       "{{ vm_password }}"
+        ansible_become:         true
+        ansible_become_method:  sudo
+        ansible_become_pass:    "{{ vm_password }}"
+        ansible_ssh_extra_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+        fwd_ssh_ip:             "{{ ssh_ip }}"
+        fwd_vm_user:            "{{ vm_user }}"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PLAY 2 — New VM: wait for SSH, write + run setup script, clean up
+# ══════════════════════════════════════════════════════════════════════════════
+- name: "Bootstrap new VM"
+  hosts: new_vm
+  gather_facts: false
+
+  tasks:
+
+    - name: "12. Wait for SSH to become available"
+      ansible.builtin.wait_for_connection:
+        delay:   10
+        timeout: 300
+
+    - name: "13. Gather facts"
+      ansible.builtin.setup:
+
+    - name: "14. Write setup script to /tmp/setup.sh"
+      ansible.builtin.copy:
+        dest:    /tmp/setup.sh
+        mode:    "0700"
+        content: |
+          #!/bin/bash
+          set -e
+
+          SSH_IP="{{ fwd_ssh_ip }}"
+          ACTUAL_USER="{{ fwd_vm_user }}"
+
+          echo "--- Admin IP  : $SSH_IP ---"
+          echo "--- Setup for : $ACTUAL_USER ---"
+
+          # ── 1. Prerequisites ───────────────────────────────────────────────
+          dpkg --configure -a || true
+          apt-get -f install -y || true
+          apt-get update -qq
+          apt-get install -y ufw curl wget iptables
+
+          # ── 2. Docker log rotation ─────────────────────────────────────────
+          echo "--- Configuring Docker log rotation ---"
+          mkdir -p /etc/docker
+          cat > /etc/docker/daemon.json <<EOF
+          {
+            "log-driver": "json-file",
+            "log-opts": {
+              "max-size": "10m",
+              "max-file": "3"
+            }
+          }
+          EOF
+
+          # ── 3. Docker ──────────────────────────────────────────────────────
+          echo "--- Installing Docker Engine ---"
+          curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
+          sh /tmp/get-docker.sh
+          rm /tmp/get-docker.sh
+
+          echo "--- Adding $ACTUAL_USER to docker group ---"
+          groupadd -f docker || true
+          usermod -aG docker "$ACTUAL_USER"
+
+          # ── 4. Enable UFW before ufw-docker ───────────────────────────────
+          echo "--- Enabling UFW ---"
+          ufw --force reset
+          ufw default deny incoming
+          ufw default allow outgoing
+          ufw default deny routed
+
+          # SSH open temporarily so Ansible can finish
+          ufw allow 22/tcp comment 'SSH - temporary open'
+          ufw --force enable
+
+          # ── 5. ufw-docker ──────────────────────────────────────────────────
+          echo "--- Installing ufw-docker ---"
+          wget -qO /usr/local/bin/ufw-docker \
+            https://raw.githubusercontent.com/chaifeng/ufw-docker/master/ufw-docker
+          chmod +x /usr/local/bin/ufw-docker
+          /usr/local/bin/ufw-docker install
+          systemctl restart docker
+
+          # ── 6. Deploy Traefik ──────────────────────────────────────────────
+          echo "--- Deploying Traefik ---"
+          mkdir -p /opt/traefik
+
+          cat > /opt/traefik/traefik.yml <<EOF
+          api:
+            dashboard: true
+            insecure: true
+          providers:
+            docker:
+              exposedByDefault: false
+          entryPoints:
+            web:
+              address: ":80"
+            websecure:
+              address: ":443"
+          log:
+            level: INFO
+          EOF
+
+          docker rm -f traefik 2>/dev/null || true
+          docker run -d \
+            --name traefik \
+            --restart unless-stopped \
+            -p 80:80 \
+            -p 443:443 \
+            -p 8081:8080 \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v /opt/traefik/traefik.yml:/etc/traefik/traefik.yml \
+            traefik:latest
+
+          # ── 7. Deploy Dockhand ─────────────────────────────────────────────
+          echo "--- Deploying Dockhand ---"
+          mkdir -p /opt/dockhand
+          docker rm -f dockhand 2>/dev/null || true
+
+          docker run -d \
+            --name dockhand \
+            --restart unless-stopped \
+            -p 8080:3000 \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v /opt/dockhand:/app/data \
+            -e HOST_DATA_DIR=/opt/dockhand \
+            fnsys/dockhand:latest
+
+          # ── 8. UFW rules — route rules via FORWARD chain (persistent, drift-proof) ──
+          # ufw route targets the FORWARD chain via ufw-user-forward,
+          # which runs before ufw-docker's deny rules in DOCKER-USER.
+          # No container IPs — rules survive restarts and IP reassignments.
+          echo "--- Configuring UFW route rules ---"
+
+          ufw route allow proto tcp from "$SSH_IP" to any port 80   comment 'Traefik HTTP - admin IP only'
+          ufw route allow proto tcp from "$SSH_IP" to any port 443  comment 'Traefik HTTPS - admin IP only'
+          ufw route allow proto tcp from "$SSH_IP" to any port 8080 comment 'Traefik dashboard - admin IP only'
+          ufw route allow proto tcp from "$SSH_IP" to any port 3000 comment 'Dockhand - admin IP only'
+
+          ufw reload
+
+          # ── Persist admin IP ───────────────────────────────────────────────
+          cat > /etc/ufw-admin-ip.conf <<EOF
+          # Written by Ansible provision on $(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          ADMIN_IP=$SSH_IP
+          EOF
+
+          # ── Summary ────────────────────────────────────────────────────────
+          SERVER_IP=$(hostname -I | awk '{print $1}')
+          echo "----------------------------------------------------------------"
+          echo "SUCCESS"
+          echo "  Admin IP      : $SSH_IP"
+          echo "  SSH           : port 22 (temporarily open — locked after)"
+          echo "  Traefik HTTP  : http://$SERVER_IP:80       → admin IP only"
+          echo "  Traefik HTTPS : https://$SERVER_IP:443     → admin IP only"
+          echo "  Traefik UI    : http://$SERVER_IP:8081     → admin IP only"
+          echo "  Dockhand      : http://$SERVER_IP:8080     → admin IP only"
+          echo "----------------------------------------------------------------"
+          ufw status verbose || true
+          ufw-docker status || true
+      become: false
+
+    - name: "15. Run setup script"
+      ansible.builtin.command: /tmp/setup.sh
+      become: true
+      register: setup_output
+      ignore_errors: true
+
+    - name: "15b. Reset SSH connection after UFW enable"
+      ansible.builtin.meta: reset_connection
+
+    - name: "16. Remove setup script"
+      ansible.builtin.file:
+        path:  /tmp/setup.sh
+        state: absent
+      become: true
+
+    - name: "17. Print setup output"
+      ansible.builtin.debug:
+        msg: "{{ setup_output.stdout_lines }}"
+
+    - name: "18. Lock SSH to admin IP only"
+      ansible.builtin.command: >
+        bash -c "
+        ufw delete allow 22/tcp;
+        ufw allow from {{ fwd_ssh_ip }} to any port 22 proto tcp comment 'SSH - admin IP only';
+        ufw reload
+        "
+      become: true
+
+    - name: "19. Create wizard directory"
+      ansible.builtin.file:
+        path:  /opt/ufw-wizard
+        state: directory
+        owner: root
+        group: root
+        mode:  "0755"
+      become: true
+
+    - name: "20. Write UFW Access Wizard script"
+      ansible.builtin.copy:
+        dest:  /opt/ufw-wizard/ufw-wizard.sh
+        owner: root
+        group: root
+        mode:  "0700"
+        content: |
+          #!/bin/bash
+          # ============================================================
+          #  UFW Access Wizard
+          #  Manage SSH and container firewall rules interactively
+          # ============================================================
+
+          RED='\033[0;31m'
+          GREEN='\033[0;32m'
+          YELLOW='\033[0;33m'
+          BLUE='\033[0;34m'
+          CYAN='\033[0;36m'
+          WHITE='\033[0;37m'
+          BOLD='\033[1m'
+          DIM='\033[2m'
+          NC='\033[0m'
+
+          OK="${GREEN}✓${NC}"
+          FAIL="${RED}✗${NC}"
+          WARN="${YELLOW}!${NC}"
+
+          if [ "$EUID" -ne 0 ]; then
+            echo -e "\n  ${RED}${BOLD}Permission denied.${NC} Please run with sudo.\n"
+            exit 1
+          fi
+
+          divider() {
+            echo -e "  ${DIM}────────────────────────────────────────────────────${NC}"
+          }
+
+          header() {
+            clear
+            echo ""
+            echo -e "  ${BOLD}${CYAN}┌─────────────────────────────────────────────────┐${NC}"
+            echo -e "  ${BOLD}${CYAN}│${NC}          ${BOLD}UFW Access Wizard${NC}                        ${BOLD}${CYAN}│${NC}"
+            echo -e "  ${BOLD}${CYAN}│${NC}  ${DIM}Manage SSH and container firewall rules${NC}          ${BOLD}${CYAN}│${NC}"
+            echo -e "  ${BOLD}${CYAN}└─────────────────────────────────────────────────┘${NC}"
+            echo ""
+          }
+
+          section() {
+            echo ""
+            echo -e "  ${BOLD}${BLUE}$1${NC}"
+            divider
+          }
+
+          validate_ip() {
+            local ip=$1
+            if [[ $ip =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+              IFS='.' read -r -a octets <<< "$ip"
+              for octet in "${octets[@]}"; do
+                [ "$octet" -gt 255 ] && return 1
+              done
+              return 0
+            fi
+            return 1
+          }
+
+          prompt_ip() {
+            local ip
+            while true; do
+              printf "  \033[0;36m›\033[0m IP address: " >&2
+              read -r ip
+              if validate_ip "$ip"; then
+                echo "$ip"
+                return
+              else
+                echo -e "  ${FAIL} ${RED}Invalid IP format. Example: 192.168.1.10${NC}" >&2
+              fi
+            done
+          }
+
+          prompt() {
+            local msg=$1
+            local result
+            printf "  \033[0;36m›\033[0m %s" "$msg" >&2
+            read -r result
+            echo "$result"
+          }
+
+          back_or_exit() {
+            echo ""
+            divider
+            echo -e "  ${DIM}[M] Main menu   [Q] Quit${NC}"
+            printf "\n  › "
+            read -r nav
+            case ${nav,,} in
+              q) echo -e "\n  ${DIM}Goodbye.${NC}\n"; exit 0 ;;
+              *) main_menu ;;
+            esac
+          }
+
+          ufw_numbered_rules() {
+            ufw status numbered 2>/dev/null | awk '/^\[/'
+          }
+
+          main_menu() {
+            header
+
+            local rule_count
+            rule_count=$(ufw_numbered_rules | wc -l)
+            local ufw_status
+            ufw_status=$(ufw status | head -1 | awk '{print $2}')
+
+            echo -e "  ${DIM}UFW:${NC} ${BOLD}${ufw_status}${NC}   ${DIM}Rules:${NC} ${BOLD}${rule_count}${NC}"
+            echo ""
+            divider
+            echo ""
+            echo -e "  ${BOLD}1${NC}  Allow an IP to SSH"
+            echo -e "  ${BOLD}2${NC}  Allow an IP to access container(s)"
+            echo -e "  ${BOLD}3${NC}  Revoke all access for an IP"
+            echo -e "  ${BOLD}4${NC}  Delete a specific rule"
+            echo -e "  ${BOLD}5${NC}  List IPs with access"
+            echo -e "  ${BOLD}6${NC}  Show raw UFW rules"
+            echo -e "  ${BOLD}7${NC}  Exit"
+            echo ""
+            divider
+            printf "\n  › Choose [1-7]: "
+            read -r choice
+            echo ""
+
+            case $choice in
+              1) allow_ssh ;;
+              2) allow_container_access ;;
+              3) revoke_ip ;;
+              4) delete_rule ;;
+              5) list_access ;;
+              6) show_rules ;;
+              7) echo -e "  ${DIM}Goodbye.${NC}\n"; exit 0 ;;
+              *) echo -e "  ${FAIL} ${RED}Invalid option.${NC}"; sleep 1; main_menu ;;
+            esac
+          }
+
+          allow_ssh() {
+            header
+            section "Allow SSH Access"
+            echo ""
+
+            local ip
+            ip=$(prompt_ip)
+
+            if ufw status | grep -qF "from $ip"; then
+              if ufw status | grep "from $ip" | grep -q '\b22\b'; then
+                echo -e "\n  ${WARN} ${YELLOW}SSH rule already exists for ${BOLD}$ip${NC}"
+              else
+                ufw allow from "$ip" to any port 22 proto tcp comment "SSH - $ip" > /dev/null
+                ufw reload > /dev/null
+                echo -e "\n  ${OK} ${GREEN}SSH access granted to ${BOLD}$ip${NC}"
+              fi
+            else
+              ufw allow from "$ip" to any port 22 proto tcp comment "SSH - $ip" > /dev/null
+              ufw reload > /dev/null
+              echo -e "\n  ${OK} ${GREEN}SSH access granted to ${BOLD}$ip${NC}"
+            fi
+
+            back_or_exit
+          }
+
+          allow_container_access() {
+            header
+            section "Allow Container Access"
+            echo ""
+
+            local ip
+            ip=$(prompt_ip)
+            echo ""
+
+            mapfile -t containers < <(docker ps --format '{{.Names}}')
+
+            if [ ${#containers[@]} -eq 0 ]; then
+              echo -e "  ${FAIL} ${RED}No running containers found.${NC}"
+              back_or_exit
+              return
+            fi
+
+            echo -e "  ${BOLD}Running containers:${NC}"
+            echo ""
+
+            local i=1
+            for name in "${containers[@]}"; do
+              local ports
+              ports=$(docker inspect "$name" --format \
+                '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{$p}} {{end}}{{end}}' \
+                2>/dev/null | tr ' ' '\n' | grep -v '^$' | tr '\n' '  ')
+              printf "  ${BOLD}%2d${NC}  %-25s ${DIM}%s${NC}\n" "$i" "$name" "$ports"
+              ((i++))
+            done
+
+            echo ""
+            printf "  ${BOLD}%2d${NC}  ${YELLOW}All containers${NC}\n" "$i"
+            echo ""
+            divider
+            printf "\n  › Choose [1-%d]: " "$i"
+            read -r sel
+            echo ""
+
+            if ! [[ "$sel" =~ ^[0-9]+$ ]]; then
+              echo -e "  ${FAIL} ${RED}Invalid selection.${NC}"
+              back_or_exit
+              return
+            fi
+
+            if [ "$sel" -eq "$i" ]; then
+              for name in "${containers[@]}"; do
+                _allow_container "$ip" "$name"
+              done
+            elif [ "$sel" -ge 1 ] && [ "$sel" -lt "$i" ]; then
+              _allow_container "$ip" "${containers[$((sel-1))]}"
+            else
+              echo -e "  ${FAIL} ${RED}Invalid selection.${NC}"
+              back_or_exit
+              return
+            fi
+
+            ufw reload > /dev/null
+            back_or_exit
+          }
+
+          _allow_container() {
+            local ip=$1
+            local name=$2
+
+            mapfile -t container_ports < <(docker inspect "$name" \
+              --format '{{range $p, $conf := .NetworkSettings.Ports}}{{if $conf}}{{$p}}{{"\n"}}{{end}}{{end}}' \
+              2>/dev/null | grep -v '^$')
+
+            if [ ${#container_ports[@]} -eq 0 ]; then
+              echo -e "  ${WARN} ${YELLOW}No published ports for '${BOLD}$name${NC}${YELLOW}'. Skipping.${NC}"
+              return
+            fi
+
+            echo -e "  ${BOLD}$name${NC}"
+            for cp in "${container_ports[@]}"; do
+              local port proto
+              port=$(echo "$cp" | cut -d'/' -f1)
+              proto=$(echo "$cp" | cut -d'/' -f2)
+
+              if ufw_numbered_rules | grep -qE "FWD.*${ip}.*${port}/${proto}|${port}/${proto}.*FWD.*${ip}"; then
+                echo -e "    ${WARN} ${YELLOW}Route rule already exists for port $port/$proto${NC}"
+              else
+                ufw route allow proto "$proto" from "$ip" to any port "$port" \
+                  comment "$name - $ip" > /dev/null
+                echo -e "    ${OK} ${GREEN}Allowed $ip → container:$port/$proto ($name)${NC}"
+              fi
+            done
+          }
+
+          revoke_ip() {
+            header
+            section "Revoke All Access for an IP"
+            echo ""
+
+            local ip
+            ip=$(prompt_ip)
+            echo ""
+
+            mapfile -t matched < <(ufw_numbered_rules | grep -F "$ip")
+
+            if [ ${#matched[@]} -eq 0 ]; then
+              echo -e "  ${WARN} ${YELLOW}No rules found for ${BOLD}$ip${NC}"
+              back_or_exit
+              return
+            fi
+
+            echo -e "  ${BOLD}Rules to be deleted:${NC}"
+            echo ""
+            for rule in "${matched[@]}"; do
+              echo -e "  ${DIM}$rule${NC}"
+            done
+            echo ""
+            divider
+            echo ""
+            echo -e "  ${RED}${BOLD}This will remove ${#matched[@]} rule(s) for $ip.${NC}"
+            printf "  Type 'yes' to confirm: "
+            read -r confirm
+
+            if [ "$confirm" != "yes" ]; then
+              echo -e "\n  ${WARN} ${YELLOW}Cancelled.${NC}"
+              back_or_exit
+              return
+            fi
+
+            local deleted=0
+            while true; do
+              mapfile -t current < <(ufw_numbered_rules | grep -F "$ip")
+              [ ${#current[@]} -eq 0 ] && break
+              local rule_num
+              rule_num=$(echo "${current[0]}" | awk -F'[][]' '{print $2}' | tr -d ' ')
+              yes | ufw delete "$rule_num" > /dev/null 2>&1
+              ((deleted++))
+            done
+
+            ufw reload > /dev/null
+            echo -e "\n  ${OK} ${GREEN}Removed ${BOLD}$deleted${NC}${GREEN} rule(s) for ${BOLD}$ip${NC}"
+
+            back_or_exit
+          }
+
+          delete_rule() {
+            header
+            section "Delete a Specific Rule"
+            echo ""
+
+            mapfile -t raw_rules < <(ufw_numbered_rules)
+
+            if [ ${#raw_rules[@]} -eq 0 ]; then
+              echo -e "  ${WARN} ${YELLOW}No UFW rules found.${NC}"
+              back_or_exit
+              return
+            fi
+
+            echo -e "  ${BOLD}Active rules:${NC}"
+            echo ""
+
+            local i=1
+            for rule in "${raw_rules[@]}"; do
+              printf "  \033[1m%2d\033[0m  %s\n" "$i" "$rule"
+              ((i++))
+            done
+
+            local all_idx=$i
+            echo ""
+            printf "  \033[1m%2d\033[0m  \033[0;31mDelete ALL rules\033[0m\n" "$all_idx"
+            printf "  \033[1m%2d\033[0m  \033[2mCancel\033[0m\n" "$((all_idx+1))"
+            echo ""
+            divider
+            printf "\n  › Choose [1-%d]: " "$((all_idx+1))"
+            read -r sel
+            echo ""
+
+            if ! [[ "$sel" =~ ^[0-9]+$ ]]; then
+              echo -e "  ${FAIL} ${RED}Invalid selection.${NC}"
+              back_or_exit
+              return
+            fi
+
+            if [ "$sel" -eq "$((all_idx+1))" ]; then
+              echo -e "  ${WARN} ${YELLOW}Cancelled.${NC}"
+              back_or_exit
+              return
+            fi
+
+            if [ "$sel" -eq "$all_idx" ]; then
+              echo -e "  ${RED}${BOLD}WARNING: This will delete ALL rules and reset UFW defaults.${NC}"
+              printf "  Type 'yes' to confirm: "
+              read -r confirm
+              if [ "$confirm" = "yes" ]; then
+                ufw --force reset > /dev/null
+                ufw default deny incoming > /dev/null
+                ufw default allow outgoing > /dev/null
+                ufw default deny routed > /dev/null
+                ufw --force enable > /dev/null
+                echo -e "  ${OK} ${GREEN}All rules deleted. Defaults restored.${NC}"
+              else
+                echo -e "  ${WARN} ${YELLOW}Cancelled.${NC}"
+              fi
+              back_or_exit
+              return
+            fi
+
+            if [ "$sel" -ge 1 ] && [ "$sel" -lt "$all_idx" ]; then
+              local rule_line="${raw_rules[$((sel-1))]}"
+              echo -e "  Deleting: ${DIM}$rule_line${NC}"
+              printf "\n  Confirm? [y/N]: "
+              read -r confirm
+              if [[ ${confirm,,} == "y" ]]; then
+                local rule_num
+                rule_num=$(echo "$rule_line" | awk -F'[][]' '{print $2}' | tr -d ' ')
+                yes | ufw delete "$rule_num" > /dev/null 2>&1
+                ufw reload > /dev/null
+                echo -e "\n  ${OK} ${GREEN}Rule deleted.${NC}"
+              else
+                echo -e "  ${WARN} ${YELLOW}Cancelled.${NC}"
+              fi
+            else
+              echo -e "  ${FAIL} ${RED}Invalid selection.${NC}"
+            fi
+
+            back_or_exit
+          }
+
+          list_access() {
+            header
+            section "IPs With Access"
+            echo ""
+
+            mapfile -t ips < <(
+              ufw status | grep -E 'ALLOW|FWD' \
+              | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' \
+              | grep -vE '^172\.|^10\.|^192\.168\.' \
+              | sort -u
+            )
+
+            if [ ${#ips[@]} -eq 0 ]; then
+              echo -e "  ${WARN} ${YELLOW}No IP-specific rules found.${NC}"
+              back_or_exit
+              return
+            fi
+
+            for ip in "${ips[@]}"; do
+              echo -e "  ${BOLD}${CYAN}$ip${NC}"
+
+              if ufw status | grep -F "$ip" | grep -q '22'; then
+                echo -e "    ${OK}  SSH ${DIM}(port 22)${NC}"
+              fi
+
+              while IFS= read -r line; do
+                if echo "$line" | grep -qE 'FWD'; then
+                  local port comment cname
+                  port=$(echo "$line" | grep -oE '[0-9]+/tcp|[0-9]+/udp' | head -1)
+                  comment=$(echo "$line" | sed 's/.*# //')
+                  cname=$(echo "$comment" | sed 's/ - .*//' | xargs 2>/dev/null || true)
+                  if [ -n "$port" ]; then
+                    if [ -n "$cname" ] && [ "$cname" != "$line" ]; then
+                      echo -e "    ${OK}  Container: ${BOLD}$cname${NC} ${DIM}→ port $port${NC}"
+                    else
+                      echo -e "    ${OK}  Container route: ${DIM}port $port${NC}"
+                    fi
+                  fi
+                fi
+              done < <(ufw status | grep -F "$ip")
+
+              echo ""
+            done
+
+            divider
+            echo -e "  ${DIM}${#ips[@]} IP(s) with active rules${NC}"
+
+            back_or_exit
+          }
+
+          show_rules() {
+            header
+            section "Raw UFW Rules"
+            echo ""
+            ufw status verbose
+            echo ""
+            back_or_exit
+          }
+
+          main_menu
+      become: true
+
+    - name: "21. Print final summary"
+      ansible.builtin.debug:
+        msg:
+          - "╔══════════════════════════════════════════════════════════════╗"
+          - "║                  PROVISIONING COMPLETE                      ║"
+          - "╠══════════════════════════════════════════════════════════════╣"
+          - "║  SERVICES                                                    ║"
+          - "╠══════════════════════════════════════════════════════════════╣"
+          - "║  Traefik HTTP       →  http://{{ ansible_host }}:80          "
+          - "║  Traefik HTTPS      →  https://{{ ansible_host }}:443        "
+          - "║  Traefik Dashboard  →  http://{{ ansible_host }}:8081        "
+          - "║  Dockhand           →  http://{{ ansible_host }}:8080        "
+          - "╠══════════════════════════════════════════════════════════════╣"
+          - "║  ACCESS                                                      ║"
+          - "╠══════════════════════════════════════════════════════════════╣"
+          - "║  SSH restricted to {{ fwd_ssh_ip }} only                     "
+          - "╠══════════════════════════════════════════════════════════════╣"
+          - "║  UFW ACCESS WIZARD                                           ║"
+          - "╠══════════════════════════════════════════════════════════════╣"
+          - "║  Location  →  /opt/ufw-wizard/ufw-wizard.sh                 ║"
+          - "║  Run with  →  sudo /opt/ufw-wizard/ufw-wizard.sh            ║"
+          - "╚══════════════════════════════════════════════════════════════╝"
