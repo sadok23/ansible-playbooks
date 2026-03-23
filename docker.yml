@@ -229,6 +229,8 @@
           echo "--- Setup for : $ACTUAL_USER ---"
 
           # ── 1. Prerequisites ───────────────────────────────────────────────
+          dpkg --configure -a || true
+          apt-get -f install -y || true
           apt-get update -qq
           apt-get install -y ufw curl wget iptables
 
