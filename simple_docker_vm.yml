@@ -227,7 +227,12 @@
         state: present
         update_cache: true
       become: true
-
+    - name: "15b. Ensure /etc/docker directory exists"
+      ansible.builtin.file:
+        path: /etc/docker
+        state: directory
+        mode: '0755'
+      become: true
     - name: "16. Configure Docker log rotation"
       ansible.builtin.copy:
         dest:    /etc/docker/daemon.json
