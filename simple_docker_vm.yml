@@ -1,0 +1,293 @@
+---
+# ┌──────────────────────────────────────────────────────────────────────────┐
+# │  Semaphore Variable Group (Extra Variables — JSON):                      │
+# │  {                                                                       │
+# │    "new_vm_name": "dockhand-node",                                       │
+# │    "vm_user":     "astro",                                               │
+# │    "vm_password": "root",                                                │
+# │    "ssh_ip":      "20.0.0.84"                                            │
+# │  }                                                                       │
+# └──────────────────────────────────────────────────────────────────────────┘
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PLAY 1 — Proxmox: clone, configure, start, bootstrap OS, discover IP
+# ══════════════════════════════════════════════════════════════════════════════
+- name: "Provision VM from Proxmox template"
+  hosts: proxmox
+  gather_facts: false
+  vars:
+    pve_api:      "https://{{ ansible_host }}:8006/api2/json"
+    pve_token:    "PVEAPIToken={{ proxmox_token_id }}={{ proxmox_token_secret }}"
+    proxmox_node: "pve"
+    template_id:  103
+
+  tasks:
+
+    - name: "1. Get next available VMID"
+      ansible.builtin.uri:
+        url: "{{ pve_api }}/cluster/nextid"
+        method: GET
+        headers:
+          Authorization: "{{ pve_token }}"
+        validate_certs: false
+      register: next_vmid_api
+      delegate_to: localhost
+
+    - name: "2. Set VMID fact"
+      ansible.builtin.set_fact:
+        resolved_vm_id: "{{ next_vmid_api.json.data | int }}"
+
+    - name: "3. Clone template {{ template_id }} → VMID {{ resolved_vm_id }}"
+      community.general.proxmox_kvm:
+        api_host:         "{{ ansible_host }}"
+        api_user:         "{{ proxmox_token_id.split('!')[0] }}"
+        api_token_id:     "{{ proxmox_token_id.split('!')[1] }}"
+        api_token_secret: "{{ proxmox_token_secret }}"
+        node:             "{{ proxmox_node }}"
+        vmid:             "{{ template_id }}"
+        clone:            "{{ template_id }}"
+        newid:            "{{ resolved_vm_id }}"
+        name:             "{{ new_vm_name }}"
+        full:             true
+        agent:            1
+        state:            present
+        timeout:          600
+      loop: "{{ range(0, 1) | list }}"
+      loop_control:
+        pause: 5
+      delegate_to: localhost
+
+    - name: "3b. Wait for cloned VM config to be ready"
+      ansible.builtin.uri:
+        url: "{{ pve_api }}/nodes/{{ proxmox_node }}/qemu/{{ resolved_vm_id }}/config"
+        method: GET
+        headers:
+          Authorization: "{{ pve_token }}"
+        validate_certs: false
+        status_code: 200
+      register: vm_config_check
+      until: vm_config_check.status == 200
+      retries: 20
+      delay: 5
+      delegate_to: localhost
+
+    - name: "4. Set cloud-init — user / password / DHCP"
+      ansible.builtin.uri:
+        url: "{{ pve_api }}/nodes/{{ proxmox_node }}/qemu/{{ resolved_vm_id }}/config"
+        method: PUT
+        headers:
+          Authorization: "{{ pve_token }}"
+        body_format: form-urlencoded
+        body:
+          ciuser:     "{{ vm_user }}"
+          cipassword: "{{ vm_password }}"
+          ipconfig0:  "ip=dhcp"
+        validate_certs: false
+        status_code: 200
+      delegate_to: localhost
+
+    - name: "5. Start VM {{ resolved_vm_id }}"
+      community.general.proxmox_kvm:
+        api_host:         "{{ ansible_host }}"
+        api_user:         "{{ proxmox_token_id.split('!')[0] }}"
+        api_token_id:     "{{ proxmox_token_id.split('!')[1] }}"
+        api_token_secret: "{{ proxmox_token_secret }}"
+        node:             "{{ proxmox_node }}"
+        vmid:             "{{ resolved_vm_id }}"
+        state:            started
+      delegate_to: localhost
+
+    - name: "5b. Wait for cloud-init to finish via QEMU agent"
+      ansible.builtin.uri:
+        url: "{{ pve_api }}/nodes/{{ proxmox_node }}/qemu/{{ resolved_vm_id }}/agent/exec"
+        method: POST
+        headers:
+          Authorization: "{{ pve_token }}"
+        body_format: json
+        body:
+          command:
+            - "bash"
+            - "-c"
+            - "cloud-init status | grep -q 'done' && echo OK || exit 1"
+        validate_certs: false
+        status_code: [200, 500]
+      register: ci_wait
+      until: ci_wait.status == 200
+      retries: 60
+      delay: 10
+      delegate_to: localhost
+
+    - name: "6. Configure user + enable SSH password auth via QEMU agent"
+      ansible.builtin.uri:
+        url: "{{ pve_api }}/nodes/{{ proxmox_node }}/qemu/{{ resolved_vm_id }}/agent/exec"
+        method: POST
+        headers:
+          Authorization: "{{ pve_token }}"
+        body_format: json
+        body:
+          command:
+            - "bash"
+            - "-c"
+            - |
+              id {{ vm_user }} &>/dev/null || useradd -m -s /bin/bash {{ vm_user }}
+              echo "{{ vm_user }}:{{ vm_password }}" | chpasswd
+              echo '{{ vm_user }} ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/{{ vm_user }}
+              chmod 440 /etc/sudoers.d/{{ vm_user }}
+              sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+              sed -i 's/^#*KbdInteractiveAuthentication.*/KbdInteractiveAuthentication yes/' /etc/ssh/sshd_config
+              systemctl restart ssh || systemctl restart sshd
+              reboot
+        validate_certs: false
+      register: agent_exec
+      until: agent_exec.status == 200
+      retries: 50
+      delay: 5
+      delegate_to: localhost
+
+    - name: "7. Wait for reboot to complete"
+      ansible.builtin.pause:
+        seconds: 60
+
+    - name: "8. Discover VM IP via QEMU guest agent"
+      ansible.builtin.uri:
+        url: "{{ pve_api }}/nodes/{{ proxmox_node }}/qemu/{{ resolved_vm_id }}/agent/network-get-interfaces"
+        method: GET
+        headers:
+          Authorization: "{{ pve_token }}"
+        validate_certs: false
+      register: vm_interfaces_api
+      until: >
+        vm_interfaces_api.json.data.result
+        | selectattr('name', 'ne', 'lo')
+        | map(attribute='ip-addresses')
+        | flatten
+        | selectattr('ip-address-type', 'eq', 'ipv4')
+        | list | length > 0
+      retries: 50
+      delay: 5
+      delegate_to: localhost
+
+    - name: "9. Extract VM IP fact"
+      ansible.builtin.set_fact:
+        discovered_vm_ip: >-
+          {{
+            vm_interfaces_api.json.data.result
+            | selectattr('name', 'ne', 'lo')
+            | map(attribute='ip-addresses')
+            | flatten
+            | selectattr('ip-address-type', 'eq', 'ipv4')
+            | map(attribute='ip-address')
+            | first
+          }}
+
+    - name: "10. Print discovered IP"
+      ansible.builtin.debug:
+        msg: "VM {{ resolved_vm_id }} ({{ new_vm_name }}) is live at {{ discovered_vm_ip }}"
+
+    - name: "11. Add new VM to in-memory inventory"
+      ansible.builtin.add_host:
+        name:                   "new_vm"
+        ansible_host:           "{{ discovered_vm_ip }}"
+        ansible_user:           "{{ vm_user }}"
+        ansible_password:       "{{ vm_password }}"
+        ansible_become:         true
+        ansible_become_method:  sudo
+        ansible_become_pass:    "{{ vm_password }}"
+        ansible_ssh_extra_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PLAY 2 — New VM: wait for SSH, install Docker
+# ══════════════════════════════════════════════════════════════════════════════
+- name: "Bootstrap new VM"
+  hosts: new_vm
+  gather_facts: false
+
+  tasks:
+
+    - name: "12. Wait for SSH to become available"
+      ansible.builtin.wait_for_connection:
+        delay:   10
+        timeout: 300
+
+    - name: "13. Gather facts"
+      ansible.builtin.setup:
+
+    - name: "14. Fix any interrupted dpkg state"
+      ansible.builtin.command: dpkg --configure -a
+      become: true
+      ignore_errors: true
+
+    - name: "15. Install prerequisites"
+      ansible.builtin.apt:
+        name:
+          - curl
+          - wget
+          - ca-certificates
+          - gnupg
+        state: present
+        update_cache: true
+      become: true
+
+    - name: "16. Configure Docker log rotation"
+      ansible.builtin.copy:
+        dest:    /etc/docker/daemon.json
+        content: |
+          {
+            "log-driver": "json-file",
+            "log-opts": {
+              "max-size": "10m",
+              "max-file": "3"
+            }
+          }
+        mode: "0644"
+      become: true
+
+    - name: "17. Download Docker install script"
+      ansible.builtin.get_url:
+        url:  https://get.docker.com
+        dest: /tmp/get-docker.sh
+        mode: "0700"
+      become: true
+
+    - name: "18. Run Docker install script"
+      ansible.builtin.command: /tmp/get-docker.sh
+      become: true
+      register: docker_install
+      ignore_errors: false
+
+    - name: "19. Remove Docker install script"
+      ansible.builtin.file:
+        path:  /tmp/get-docker.sh
+        state: absent
+      become: true
+
+    - name: "20. Add {{ vm_user }} to docker group"
+      ansible.builtin.user:
+        name:   "{{ vm_user }}"
+        groups: docker
+        append: true
+      become: true
+      vars:
+        vm_user: "{{ hostvars['new_vm']['ansible_user'] }}"
+
+    - name: "21. Ensure Docker service is enabled and started"
+      ansible.builtin.systemd:
+        name:    docker
+        enabled: true
+        state:   started
+      become: true
+
+    - name: "22. Verify Docker is working"
+      ansible.builtin.command: docker --version
+      become: true
+      register: docker_version
+
+    - name: "23. Print final summary"
+      ansible.builtin.debug:
+        msg:
+          - "╔══════════════════════════════════════════════════════════════╗"
+          - "║                  PROVISIONING COMPLETE                      ║"
+          - "╠══════════════════════════════════════════════════════════════╣"
+          - "║  VM IP    →  {{ ansible_host }}"
+          - "║  Docker   →  {{ docker_version.stdout }}"
+          - "╚══════════════════════════════════════════════════════════════╝"
