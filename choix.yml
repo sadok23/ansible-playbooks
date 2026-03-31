@@ -1,17 +1,19 @@
 ---
-- name: "Bootstrap VM: Docker (Rootless), Hawser, and Portainer Agent"
+- name: "Bootstrap VM: Docker, Portainer Agent, and Tailscale"
   hosts: target_node
   gather_facts: true
   
   vars:
-    # --- Default Toggles (Semaphore Extra Vars will override these) ---
+    # --- Default Toggles (Semaphore Variable Group will override these) ---
     setup_docker: true
     setup_traefik: true
     setup_hawser: true
     setup_portainer_agent: true
+    setup_tailscale: true      # New Toggle
     secure_vm: true
     install_utilities: true
     ssh_ip: "0.0.0.0/0"
+    tailscale_auth_key: ""     # Add this to your Variable Group
 
   tasks:
     # ── 1. System Preparation ──────────────────────────────────────────────
@@ -20,15 +22,38 @@
         name: [ufw, curl, wget, iptables, software-properties-common, python3-pip]
         update_cache: yes
         state: present
-      when: install_utilities
+      when: install_utilities | bool
       become: true
 
-    # ── 2. Docker Engine & Permissions ─────────────────────────────────────
+    # ── 2. Tailscale Installation ──────────────────────────────────────────
+    - name: "Install and Connect Tailscale"
+      when: setup_tailscale | bool
+      become: true
+      block:
+        - name: "Run Tailscale installation script"
+          ansible.builtin.shell:
+            cmd: "curl -fsSL https://tailscale.com/install.sh | sh"
+            creates: /usr/bin/tailscale
+
+        - name: "Check if Tailscale is already authenticated"
+          ansible.builtin.command: tailscale status
+          register: tailscale_status
+          failed_when: false
+          changed_when: false
+
+        - name: "Bring Tailscale up"
+          ansible.builtin.command: "tailscale up --authkey={{ tailscale_auth_key }}"
+          when: 
+            - tailscale_status.rc != 0 
+            - tailscale_auth_key != ""
+          no_log: true
+
+    # ── 3. Docker Engine & Permissions ─────────────────────────────────────
     - name: "Install Docker via official script"
       ansible.builtin.shell: 
         cmd: "curl -fsSL https://get.docker.com | sh"
         creates: /usr/bin/docker
-      when: setup_docker
+      when: setup_docker | bool
       become: true
 
     - name: "Ensure {{ ansible_user }} is in the docker group"
@@ -36,7 +61,7 @@
         name: "{{ ansible_user }}"
         groups: docker
         append: yes
-      when: setup_docker
+      when: setup_docker | bool
       become: true
 
     - name: "Configure Docker log rotation"
@@ -49,7 +74,7 @@
             "log-opts": { "max-size": "10m", "max-file": "3" }
           }
       register: docker_cfg
-      when: setup_docker
+      when: setup_docker | bool
       become: true
 
     - name: "Restart Docker and reset connection"
@@ -59,21 +84,21 @@
             state: restarted
             enabled: yes
         - ansible.builtin.meta: reset_connection
-      when: setup_docker and docker_cfg.changed
+      when: (setup_docker | bool) and docker_cfg.changed
       become: true
 
-# ── 3. Security Block (Corrected) ──────────────────────────────────
+    # ── 4. Security Block (Corrected) ──────────────────────────────────
     - name: "Apply Firewall and SSH Security"
-      when: secure_vm
+      when: secure_vm | bool
       become: true
       block:
-        - name: "Force iptables to legacy backend (required for ufw-docker)"
+        - name: "Force iptables to legacy backend"
           community.general.alternatives:
             name: iptables
             path: /usr/sbin/iptables-legacy
           when: ansible_os_family == "Debian"
 
-        - name: "Ensure UFW is enabled and service is running"
+        - name: "Ensure UFW is enabled"
           community.general.ufw:
             state: enabled
 
@@ -102,12 +127,19 @@
             from_ip: "{{ ssh_ip }}"
             comment: "Management SSH"
 
+        - name: "Allow Tailscale interface traffic"
+          community.general.ufw:
+            rule: allow
+            interface: tailscale0
+            direction: in
+          when: setup_tailscale | bool
+
         - name: "Allow Admin IP to access services"
           ansible.builtin.command: "ufw route allow proto tcp from {{ ssh_ip }} to any port {{ item }}"
           loop: [80, 443, 8081, 2376, 9001]
           changed_when: false
 
-    # ── 4. Application Deployment ─────────────────────────────────────────
+    # ── 5. Application Deployment ─────────────────────────────────────────
     - name: "Deploy Service Stack"
       become: true
       block:
@@ -124,7 +156,7 @@
                   entryPoints:
                     web: { address: ":80" }
                     websecure: { address: ":443" }
-          when: setup_traefik
+          when: setup_traefik | bool
 
         - name: "Launch Traefik container"
           community.docker.docker_container:
@@ -135,7 +167,7 @@
             volumes:
               - /var/run/docker.sock:/var/run/docker.sock
               - /opt/traefik/traefik.yml:/etc/traefik/traefik.yml
-          when: setup_traefik
+          when: setup_traefik | bool
 
         # Hawser
         - name: "Launch Hawser container"
@@ -145,7 +177,7 @@
             restart_policy: unless-stopped
             published_ports: ["2376:2376"]
             volumes: ["/var/run/docker.sock:/var/run/docker.sock"]
-          when: setup_hawser
+          when: setup_hawser | bool
 
         # Portainer Agent
         - name: "Launch Portainer Agent"
@@ -158,12 +190,11 @@
               - /var/run/docker.sock:/var/run/docker.sock
               - /var/lib/docker/volumes:/var/lib/docker/volumes
               - /:/host
-          when: setup_portainer_agent
+          when: setup_portainer_agent | bool
 
     - name: "Summary Output"
       ansible.builtin.debug:
         msg:
           - "Setup Complete!"
+          - "Tailscale: {{ 'Enabled' if (setup_tailscale | bool) else 'Skipped' }}"
           - "Portainer Agent: http://{{ ansible_host }}:9001"
-          - "Hawser: tcp://{{ ansible_host }}:2376"
-          - "Traefik Dashboard: http://{{ ansible_host }}:8081"
