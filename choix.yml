@@ -1,5 +1,5 @@
 ---
-- name: "Bootstrap Existing VM: Docker, Traefik, and Hawser"
+- name: "Bootstrap VM: Docker (Rootless), Hawser, and Portainer Agent"
   hosts: target_node
   gather_facts: true
   
@@ -8,9 +8,10 @@
     setup_docker: true
     setup_traefik: true
     setup_hawser: true
-    secure_vm: true           # Set to false to skip UFW and SSH hardening
+    setup_portainer_agent: true
+    secure_vm: true
     install_utilities: true
-    ssh_ip: "0.0.0.0/0"       # Set your management IP in Semaphore
+    ssh_ip: "0.0.0.0/0"
 
   tasks:
     # ── 1. System Preparation ──────────────────────────────────────────────
@@ -22,11 +23,19 @@
       when: install_utilities
       become: true
 
-    # ── 2. Docker Engine ──────────────────────────────────────────────────
+    # ── 2. Docker Engine & Permissions ─────────────────────────────────────
     - name: "Install Docker via official script"
       ansible.builtin.shell: 
         cmd: "curl -fsSL https://get.docker.com | sh"
         creates: /usr/bin/docker
+      when: setup_docker
+      become: true
+
+    - name: "Ensure {{ ansible_user }} is in the docker group"
+      ansible.builtin.user:
+        name: "{{ ansible_user }}"
+        groups: docker
+        append: yes
       when: setup_docker
       become: true
 
@@ -43,11 +52,13 @@
       when: setup_docker
       become: true
 
-    - name: "Restart Docker to apply log settings"
-      ansible.builtin.systemd:
-        name: docker
-        state: restarted
-        enabled: yes
+    - name: "Restart Docker and reset connection"
+      block:
+        - ansible.builtin.systemd:
+            name: docker
+            state: restarted
+            enabled: yes
+        - ansible.builtin.meta: reset_connection
       when: setup_docker and docker_cfg.changed
       become: true
 
@@ -82,38 +93,28 @@
             from_ip: "{{ ssh_ip }}"
             comment: "Management SSH"
 
-        - name: "Allow Admin IP to access services (including Hawser 2376)"
+        - name: "Allow Admin IP to access services"
           ansible.builtin.command: "ufw route allow proto tcp from {{ ssh_ip }} to any port {{ item }}"
-          loop: [80, 443, 8081, 2376]
+          loop: [80, 443, 8081, 2376, 9001]
           changed_when: false
 
     # ── 4. Application Deployment ─────────────────────────────────────────
-    - name: "Deploy Traefik and Hawser"
+    - name: "Deploy Service Stack"
       become: true
       block:
-        - name: "Ensure Traefik directory exists"
-          ansible.builtin.file:
-            path: "/opt/traefik"
-            state: directory
-            mode: '0755'
-          when: setup_traefik
-
-        - name: "Create Traefik configuration"
-          ansible.builtin.copy:
-            dest: /opt/traefik/traefik.yml
-            mode: '0644'
-            content: |
-              api:
-                dashboard: true
-                insecure: true
-              providers:
-                docker:
-                  exposedByDefault: false
-              entryPoints:
-                web:
-                  address: ":80"
-                websecure:
-                  address: ":443"
+        # Traefik
+        - name: "Create Traefik directory and config"
+          block:
+            - ansible.builtin.file: { path: "/opt/traefik", state: directory, mode: '0755' }
+            - ansible.builtin.copy:
+                dest: /opt/traefik/traefik.yml
+                mode: '0644'
+                content: |
+                  api: { dashboard: true, insecure: true }
+                  providers: { docker: { exposedByDefault: false } }
+                  entryPoints:
+                    web: { address: ":80" }
+                    websecure: { address: ":443" }
           when: setup_traefik
 
         - name: "Launch Traefik container"
@@ -121,32 +122,39 @@
             name: traefik
             image: traefik:latest
             restart_policy: unless-stopped
-            state: started
-            published_ports:
-              - "80:80"
-              - "443:443"
-              - "8081:8080"
+            published_ports: ["80:80", "443:443", "8081:8080"]
             volumes:
               - /var/run/docker.sock:/var/run/docker.sock
               - /opt/traefik/traefik.yml:/etc/traefik/traefik.yml
           when: setup_traefik
 
+        # Hawser
         - name: "Launch Hawser container"
           community.docker.docker_container:
             name: hawser
             image: ghcr.io/finsys/hawser:latest
             restart_policy: unless-stopped
-            state: started
-            published_ports:
-              - "2376:2376"
+            published_ports: ["2376:2376"]
+            volumes: ["/var/run/docker.sock:/var/run/docker.sock"]
+          when: setup_hawser
+
+        # Portainer Agent
+        - name: "Launch Portainer Agent"
+          community.docker.docker_container:
+            name: portainer_agent
+            image: portainer/agent:2.40.0
+            restart_policy: always
+            published_ports: ["9001:9001"]
             volumes:
               - /var/run/docker.sock:/var/run/docker.sock
-          when: setup_hawser
+              - /var/lib/docker/volumes:/var/lib/docker/volumes
+              - /:/host
+          when: setup_portainer_agent
 
     - name: "Summary Output"
       ansible.builtin.debug:
         msg:
           - "Setup Complete!"
-          - "Security applied: {{ secure_vm }}"
+          - "Portainer Agent: http://{{ ansible_host }}:9001"
+          - "Hawser: tcp://{{ ansible_host }}:2376"
           - "Traefik Dashboard: http://{{ ansible_host }}:8081"
-          - "Hawser Endpoint:  tcp://{{ ansible_host }}:2376"
