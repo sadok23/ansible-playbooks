@@ -1,0 +1,152 @@
+---
+- name: "Bootstrap Existing VM: Docker, Traefik, and Hawser"
+  hosts: target_node
+  gather_facts: true
+  
+  vars:
+    # --- Default Toggles (Semaphore Extra Vars will override these) ---
+    setup_docker: true
+    setup_traefik: true
+    setup_hawser: true
+    secure_vm: true           # Set to false to skip UFW and SSH hardening
+    install_utilities: true
+    ssh_ip: "0.0.0.0/0"       # Set your management IP in Semaphore
+
+  tasks:
+    # ── 1. System Preparation ──────────────────────────────────────────────
+    - name: "Update apt cache and install base utilities"
+      ansible.builtin.apt:
+        name: [ufw, curl, wget, iptables, software-properties-common, python3-pip]
+        update_cache: yes
+        state: present
+      when: install_utilities
+      become: true
+
+    # ── 2. Docker Engine ──────────────────────────────────────────────────
+    - name: "Install Docker via official script"
+      ansible.builtin.shell: 
+        cmd: "curl -fsSL https://get.docker.com | sh"
+        creates: /usr/bin/docker
+      when: setup_docker
+      become: true
+
+    - name: "Configure Docker log rotation"
+      ansible.builtin.copy:
+        dest: /etc/docker/daemon.json
+        mode: '0644'
+        content: |
+          {
+            "log-driver": "json-file",
+            "log-opts": { "max-size": "10m", "max-file": "3" }
+          }
+      register: docker_cfg
+      when: setup_docker
+      become: true
+
+    - name: "Restart Docker to apply log settings"
+      ansible.builtin.systemd:
+        name: docker
+        state: restarted
+        enabled: yes
+      when: setup_docker and docker_cfg.changed
+      become: true
+
+    # ── 3. Security Block (Conditional) ──────────────────────────────────
+    - name: "Apply Firewall and SSH Security"
+      when: secure_vm
+      become: true
+      block:
+        - name: "Download ufw-docker utility"
+          ansible.builtin.get_url:
+            url: https://raw.githubusercontent.com/chaifeng/ufw-docker/master/ufw-docker
+            dest: /usr/local/bin/ufw-docker
+            mode: '0755'
+
+        - name: "Install ufw-docker configuration"
+          ansible.builtin.command: /usr/local/bin/ufw-docker install
+          register: ufw_dock_out
+          changed_when: "'already installed' not in ufw_dock_out.stdout"
+
+        - name: "Set UFW default policies"
+          community.general.ufw:
+            state: enabled
+            policy: deny
+            direction: "{{ item }}"
+          loop: [incoming, routed]
+
+        - name: "Allow SSH from Admin IP only"
+          community.general.ufw:
+            rule: allow
+            port: '22'
+            proto: tcp
+            from_ip: "{{ ssh_ip }}"
+            comment: "Management SSH"
+
+        - name: "Allow Admin IP to access services (including Hawser 2376)"
+          ansible.builtin.command: "ufw route allow proto tcp from {{ ssh_ip }} to any port {{ item }}"
+          loop: [80, 443, 8081, 2376]
+          changed_when: false
+
+    # ── 4. Application Deployment ─────────────────────────────────────────
+    - name: "Deploy Traefik and Hawser"
+      become: true
+      block:
+        - name: "Ensure Traefik directory exists"
+          ansible.builtin.file:
+            path: "/opt/traefik"
+            state: directory
+            mode: '0755'
+          when: setup_traefik
+
+        - name: "Create Traefik configuration"
+          ansible.builtin.copy:
+            dest: /opt/traefik/traefik.yml
+            mode: '0644'
+            content: |
+              api:
+                dashboard: true
+                insecure: true
+              providers:
+                docker:
+                  exposedByDefault: false
+              entryPoints:
+                web:
+                  address: ":80"
+                websecure:
+                  address: ":443"
+          when: setup_traefik
+
+        - name: "Launch Traefik container"
+          community.docker.docker_container:
+            name: traefik
+            image: traefik:latest
+            restart_policy: unless-stopped
+            state: started
+            published_ports:
+              - "80:80"
+              - "443:443"
+              - "8081:8080"
+            volumes:
+              - /var/run/docker.sock:/var/run/docker.sock
+              - /opt/traefik/traefik.yml:/etc/traefik/traefik.yml
+          when: setup_traefik
+
+        - name: "Launch Hawser container"
+          community.docker.docker_container:
+            name: hawser
+            image: ghcr.io/finsys/hawser:latest
+            restart_policy: unless-stopped
+            state: started
+            published_ports:
+              - "2376:2376"
+            volumes:
+              - /var/run/docker.sock:/var/run/docker.sock
+          when: setup_hawser
+
+    - name: "Summary Output"
+      ansible.builtin.debug:
+        msg:
+          - "Setup Complete!"
+          - "Security applied: {{ secure_vm }}"
+          - "Traefik Dashboard: http://{{ ansible_host }}:8081"
+          - "Hawser Endpoint:  tcp://{{ ansible_host }}:2376"
