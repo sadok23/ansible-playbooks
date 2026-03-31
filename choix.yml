@@ -62,11 +62,21 @@
       when: setup_docker and docker_cfg.changed
       become: true
 
-    # ── 3. Security Block (Conditional) ──────────────────────────────────
+# ── 3. Security Block (Corrected) ──────────────────────────────────
     - name: "Apply Firewall and SSH Security"
       when: secure_vm
       become: true
       block:
+        - name: "Force iptables to legacy backend (required for ufw-docker)"
+          community.general.alternatives:
+            name: iptables
+            path: /usr/sbin/iptables-legacy
+          when: ansible_os_family == "Debian"
+
+        - name: "Ensure UFW is enabled and service is running"
+          community.general.ufw:
+            state: enabled
+
         - name: "Download ufw-docker utility"
           ansible.builtin.get_url:
             url: https://raw.githubusercontent.com/chaifeng/ufw-docker/master/ufw-docker
@@ -80,7 +90,6 @@
 
         - name: "Set UFW default policies"
           community.general.ufw:
-            state: enabled
             policy: deny
             direction: "{{ item }}"
           loop: [incoming, routed]
