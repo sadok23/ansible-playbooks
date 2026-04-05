@@ -289,3 +289,19 @@
         - name: "Authenticate with Tailscale"
           ansible.builtin.command: "tailscale up --authkey={{ tailscale_auth_key }} --accept-routes"
           changed_when: false
+
+    # ── Komodo Periphery ──────────────────────────────────────────────────────
+    - name: "Komodo Periphery: Install and Connect"
+      when: setup_komodo | bool
+      block:
+        - name: "Install Komodo Periphery"
+          ansible.builtin.shell: |
+            curl -sSL https://raw.githubusercontent.com/moghtech/komodo/main/scripts/setup-periphery.py \
+              | sudo python3 - \
+              --core-address="{{ komodo_core_address }}" \
+              --connect-as="{{ ansible_hostname }}" \
+              --onboarding-key="{{ komodo_onboarding_key }}" \
+              --version="{{ komodo_version }}"
+          args:
+            creates: /usr/local/bin/periphery
+          changed_when: false
