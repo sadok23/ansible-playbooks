@@ -1,5 +1,5 @@
 # ══════════════════════════════════════════════════════════════════════════════
-# PLAY 1 — Proxmox Provisioning (Integrated with your Agent logic)
+# PLAY 1 — Proxmox Provisioning
 # ══════════════════════════════════════════════════════════════════════════════
 - name: "Provision VM from Proxmox template"
   hosts: proxmox
@@ -37,7 +37,7 @@
         timeout:          600
       delegate_to: localhost
 
-    - name: "3. Configure Cloud-Init (Initial Pass)"
+    - name: "3. Configure Cloud-Init (DHCP)"
       ansible.builtin.uri:
         url: "{{ pve_api }}/nodes/{{ proxmox_node }}/qemu/{{ next_vmid_api.json.data }}/config"
         method: PUT
@@ -77,7 +77,7 @@
       delay: 10
       delegate_to: localhost
 
-    - name: "6. Agent-Config: Setup User, Sudoers, and Reboot"
+    - name: "6. Agent-Config: Setup User, Sudoers, SSH and Reboot"
       ansible.builtin.uri:
         url: "{{ pve_api }}/nodes/{{ proxmox_node }}/qemu/{{ next_vmid_api.json.data }}/agent/exec"
         method: POST
@@ -101,15 +101,15 @@
       ansible.builtin.pause:
         seconds: 60
 
-    - name: "8. Discover IP via Guest Agent (Fixed Conditional)"
+    - name: "8. Discover IP via Guest Agent"
       ansible.builtin.uri:
         url: "{{ pve_api }}/nodes/{{ proxmox_node }}/qemu/{{ next_vmid_api.json.data }}/agent/network-get-interfaces"
         method: GET
         headers: { Authorization: "{{ pve_token }}" }
         validate_certs: false
       register: vm_interfaces_api
-      until: 
-        - vm_interfaces_api.json.data is not none 
+      until:
+        - vm_interfaces_api.json.data is not none
         - "'result' in vm_interfaces_api.json.data"
         - "vm_interfaces_api.json.data.result | selectattr('name', 'ne', 'lo') | list | length > 0"
       retries: 50
@@ -126,74 +126,134 @@
         ansible_become_pass: "{{ vm_password }}"
         ansible_ssh_extra_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
 
+
 # ══════════════════════════════════════════════════════════════════════════════
-# PLAY 2 — New VM: Native Bootstrap (Following your setup logic)
+# PLAY 2 — Bootstrap New VM
 # ══════════════════════════════════════════════════════════════════════════════
 - name: "Bootstrap New VM"
   hosts: new_vm
   gather_facts: true
 
   tasks:
+
+    # ── Utilities ─────────────────────────────────────────────────────────────
     - name: "Install base utilities"
+      when: install_utilities | bool
       ansible.builtin.apt:
         name: [ufw, curl, wget, iptables]
         update_cache: yes
 
+    # ── Docker ────────────────────────────────────────────────────────────────
     - name: "Docker: Engine and Log Rotation"
+      when: setup_docker | bool
       block:
         - name: "Install Docker"
           ansible.builtin.shell: "curl -fsSL https://get.docker.com | sh"
           args: { creates: /usr/bin/docker }
+
         - name: "Add user to docker group"
-          ansible.builtin.user: { name: "{{ ansible_user }}", groups: docker, append: yes }
+          ansible.builtin.user:
+            name: "{{ ansible_user }}"
+            groups: docker
+            append: yes
+
         - name: "Config log rotation"
           ansible.builtin.copy:
             dest: /etc/docker/daemon.json
             content: '{"log-driver":"json-file","log-opts":{"max-size":"10m","max-file":"3"}}'
           register: d_cfg
+
         - name: "Restart Docker"
-          ansible.builtin.systemd: { name: docker, state: restarted, enabled: yes }
+          ansible.builtin.systemd:
+            name: docker
+            state: restarted
+            enabled: yes
           when: d_cfg.changed
 
+    # ── UFW / Security ────────────────────────────────────────────────────────
     - name: "Security: UFW & ufw-docker integration"
+      when: secure_vm | bool
       block:
-        - community.general.ufw: { state: enabled, policy: deny, direction: incoming }
-        - community.general.ufw: { rule: allow, port: '22', proto: tcp, from_ip: "{{ ssh_ip }}" }
+        - name: "Enable UFW with default deny incoming"
+          community.general.ufw:
+            state: enabled
+            policy: deny
+            direction: incoming
+
+        - name: "Allow SSH from admin IP only"
+          community.general.ufw:
+            rule: allow
+            port: '22'
+            proto: tcp
+            from_ip: "{{ ssh_ip }}"
+
         - name: "Install ufw-docker"
           ansible.builtin.get_url:
             url: https://raw.githubusercontent.com/chaifeng/ufw-docker/master/ufw-docker
             dest: /usr/local/bin/ufw-docker
             mode: '0755'
+
         - name: "Run ufw-docker install"
           ansible.builtin.command: /usr/local/bin/ufw-docker install
           changed_when: false
-        - name: "Allow Route Rules (Admin Only)"
+
+        - name: "Allow route rules from admin IP"
           ansible.builtin.command: "ufw route allow proto tcp from {{ ssh_ip }} to any port {{ item }}"
           loop: [80, 443, 8081, 2376, 9001]
           changed_when: false
 
-    - name: "Deploy Services"
-      block:
-        - name: "Traefik"
-          community.docker.docker_container:
-            name: traefik
-            image: traefik:latest
-            restart_policy: unless-stopped
-            published_ports: ["80:80", "443:443", "8081:8080"]
-            volumes: ["/var/run/docker.sock:/var/run/docker.sock"]
-        
-        - name: "Hawser"
-          community.docker.docker_container:
-            name: hawser
-            image: ghcr.io/finsys/hawser:latest
-            restart_policy: unless-stopped
-            published_ports: ["2376:2376"]
-            volumes: ["/var/run/docker.sock:/var/run/docker.sock"]
+    # ── Traefik ───────────────────────────────────────────────────────────────
+    - name: "Deploy Traefik"
+      when: setup_traefik | bool
+      community.docker.docker_container:
+        name: traefik
+        image: traefik:latest
+        restart_policy: unless-stopped
+        published_ports:
+          - "80:80"
+          - "443:443"
+          - "8081:8080"
+        volumes:
+          - "/var/run/docker.sock:/var/run/docker.sock"
 
-        - name: "Portainer Agent"
-          community.docker.docker_container:
-            name: portainer_agent
-            image: portainer/agent:latest
-            restart_policy: always
-            published_ports: ["9001:9001"]
-            volumes: ["/var/run/docker.sock:/var/run/docker.sock"]
+    # ── Hawser ────────────────────────────────────────────────────────────────
+    - name: "Deploy Hawser"
+      when: setup_hawser | bool
+      community.docker.docker_container:
+        name: hawser
+        image: ghcr.io/finsys/hawser:latest
+        restart_policy: unless-stopped
+        published_ports:
+          - "2376:2376"
+        volumes:
+          - "/var/run/docker.sock:/var/run/docker.sock"
+
+    # ── Portainer Agent ───────────────────────────────────────────────────────
+    - name: "Deploy Portainer Agent"
+      when: setup_portainer_agent | bool
+      community.docker.docker_container:
+        name: portainer_agent
+        image: portainer/agent:latest
+        restart_policy: always
+        published_ports:
+          - "9001:9001"
+        volumes:
+          - "/var/run/docker.sock:/var/run/docker.sock"
+
+    # ── Tailscale ─────────────────────────────────────────────────────────────
+    - name: "Tailscale: Install and Authenticate"
+      when: setup_tailscale | bool
+      block:
+        - name: "Install Tailscale"
+          ansible.builtin.shell: "curl -fsSL https://tailscale.com/install.sh | sh"
+          args: { creates: /usr/bin/tailscale }
+
+        - name: "Enable and start tailscaled"
+          ansible.builtin.systemd:
+            name: tailscaled
+            state: started
+            enabled: yes
+
+        - name: "Authenticate with Tailscale"
+          ansible.builtin.command: "tailscale up --authkey={{ tailscale_auth_key }} --accept-routes"
+          changed_when: false
