@@ -1,0 +1,21 @@
+    - name: "Add Falco Helm repo"
+      ansible.builtin.command: helm repo add falcosecurity https://falcosecurity.github.io/charts
+      changed_when: false
+
+    - name: "Update Helm repos"
+      ansible.builtin.command: helm repo update
+      changed_when: false
+
+    - name: "Create falco namespace"
+      ansible.builtin.command: kubectl create namespace falco
+      register: ns_result
+      failed_when: ns_result.rc != 0 and 'already exists' not in ns_result.stderr
+      changed_when: ns_result.rc == 0
+
+    - name: "Install Falco"
+      ansible.builtin.command: >
+        helm upgrade --install falco falcosecurity/falco
+        --namespace falco
+        --set driver.kind=modern_ebpf
+        --wait
+        --timeout 10m

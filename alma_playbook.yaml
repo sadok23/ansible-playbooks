@@ -1,0 +1,33 @@
+---
+# ══════════════════════════════════════════════════════════════════════════════
+# Configure Existing VM
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Play 1 — Freeipa ───────────────────────────────────────────────────────
+- name: "freeipa configuration"
+  hosts: target_node
+  gather_facts: true
+  tasks:
+    - name: "freeipa configuration"
+      ansible.builtin.include_tasks: alma-snippets/freeipa.yaml
+      when: freeipa_install | bool
+
+
+
+# ── Play 2 — Docker ───────────────────────────────────────────────────────
+- name: "docker installation"
+  hosts: target_node
+  gather_facts: true
+  tasks:
+    - name: "docker installation"
+      ansible.builtin.include_tasks: alma-snippets/alma_docker.yaml
+      when: docker_install | bool
+
+# ── Play 3 — Komodo ───────────────────────────────────────────────────────
+- name: "komodo agent installation"
+  hosts: target_node
+  gather_facts: true
+  tasks:
+    - name: "komodo installation"
+      ansible.builtin.include_tasks: snippets/komodo-agent.yaml
+      when: komodo_agent_install | bool

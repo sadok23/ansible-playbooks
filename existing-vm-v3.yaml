@@ -1,0 +1,101 @@
+# ── Play 0 — AWX Dependencies ────────────────────────────────────────────────
+- name: "Install AWX EE dependencies"
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: "Install required Python packages"
+      ansible.builtin.pip:
+        name:
+          - proxmoxer
+          - requests
+        state: present
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Configure Existing VM
+# ══════════════════════════════════════════════════════════════════════════════
+# ── Play 1 — Bootstrap ───────────────────────────────────────────────────────
+- name: "Installing Utilities on Existing VM"
+  hosts: target_node
+  gather_facts: true
+  vars:
+    ansible_host: "{{ ansible_ip }}"
+    ansible_user: "{{ ansible_user }}"
+    ansible_password: "{{ ansible_passwd }}"
+    ansible_become: true
+    ansible_become_pass: "{{ ansible_passwd }}"
+  tasks:
+    - name: "Include bootstrap tasks"
+      ansible.builtin.include_tasks: snippets/utilities.yaml
+
+# ── Play 2 — WireGuard ───────────────────────────────────────────────────────
+- name: "Setup Wireguard"
+  hosts: target_node
+  gather_facts: false
+  vars:
+    ansible_host: "{{ ansible_ip }}"
+    ansible_user: "{{ ansible_user }}"
+    ansible_password: "{{ ansible_passwd }}"
+    ansible_become: true
+    ansible_become_pass: "{{ ansible_passwd }}"
+  tasks:
+    - name: "Include wireguard tasks"
+      ansible.builtin.include_tasks: snippets/wireguard.yaml
+      when: setup_wireguard | bool
+
+# ── Play 3 — Komodo Core ─────────────────────────────────────────────────────
+- name: "Deploy Komodo Core"
+  hosts: target_node
+  gather_facts: false
+  vars:
+    ansible_host: "{{ ansible_ip }}"
+    ansible_user: "{{ ansible_user }}"
+    ansible_password: "{{ ansible_passwd }}"
+    ansible_become: true
+    ansible_become_pass: "{{ ansible_passwd }}"
+  tasks:
+    - name: "Include Komodo Core tasks"
+      ansible.builtin.include_tasks: snippets/komodo-core.yaml
+      when: setup_komodo_core | bool
+
+# ── Play 4 — Komodo Periphery ────────────────────────────────────────────────
+- name: "Deploy Komodo Periphery"
+  hosts: target_node
+  gather_facts: false
+  vars:
+    ansible_host: "{{ ansible_ip }}"
+    ansible_user: "{{ ansible_user }}"
+    ansible_password: "{{ ansible_passwd }}"
+    ansible_become: true
+    ansible_become_pass: "{{ ansible_passwd }}"
+  tasks:
+    - name: "Include Komodo Periphery tasks"
+      ansible.builtin.include_tasks: snippets/komodo-agent.yaml
+      when: setup_komodo_agent | bool and not setup_komodo_core | bool
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Play 5 — Summary
+# ══════════════════════════════════════════════════════════════════════════════
+- name: "Summary"
+  hosts: target_node
+  gather_facts: false
+  vars:
+    ansible_host: "{{ ansible_ip }}"
+    ansible_user: "{{ ansible_user }}"
+    ansible_password: "{{ ansible_passwd }}"
+    ansible_become: true
+    ansible_become_pass: "{{ ansible_passwd }}"
+  tasks:
+    - name: "Print deployment summary"
+      ansible.builtin.debug:
+        msg:
+          - "════════════════════════════════════════"
+          - "        Deployment Summary"
+          - "════════════════════════════════════════"
+          - "  Host      : {{ inventory_hostname }}"
+          - "  IP        : {{ ansible_ip }}"
+          - "  User      : {{ ansible_user }}"
+          - "  Docker    : {{ 'installed' if setup_docker | bool else 'skipped' }}"
+          - "  UFW       : {{ 'enabled' if secure_vm | bool else 'skipped' }}"
+          - "  WireGuard : {{ 'deployed' if setup_wireguard | bool else 'skipped' }}"
+          - "  Komodo    : {{ 'core' if setup_komodo_core | bool else 'periphery' if setup_komodo_agent | bool else 'skipped' }}"
+          - "════════════════════════════════════════"

@@ -1,0 +1,141 @@
+# ── Lock Handling ─────────────────────────────────────────────────────────
+- name: "Stop unattended-upgrades to prevent re-locking"
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    state: stopped
+    enabled: false
+  loop:
+    - unattended-upgrades
+    - apt-daily.timer
+    - apt-daily-upgrade.timer
+  failed_when: false
+
+- name: "Kill any running apt/dpkg processes"
+  ansible.builtin.shell: |
+    kill $(lsof /var/lib/dpkg/lock-frontend 2>/dev/null | awk 'NR>1 {print $2}') 2>/dev/null || true
+    kill $(lsof /var/lib/apt/lists/lock     2>/dev/null | awk 'NR>1 {print $2}') 2>/dev/null || true
+  changed_when: false
+
+- name: "Wait for apt/dpkg locks to clear (cloud-init race)"
+  ansible.builtin.shell: |
+    while fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock \
+                /var/cache/apt/archives/lock /var/lib/dpkg/lock \
+                >/dev/null 2>&1; do
+      sleep 3
+    done
+  changed_when: false
+  timeout: 300
+
+# ── Docker ────────────────────────────────────────────────────────────────
+- name: "Docker: Engine and Log Rotation"
+  when: setup_docker | bool
+  become: true
+  block:
+
+    - name: "Install Docker via curl script"
+      ansible.builtin.shell:
+        cmd: curl -fsSL https://get.docker.com | sh
+      args:
+        creates: /usr/bin/docker
+
+    - name: "Start and enable Docker"
+      ansible.builtin.systemd:
+        name: docker
+        state: started
+        enabled: true
+
+    - name: "Add user to docker group"
+      ansible.builtin.user:
+        name: "{{ ansible_user }}"
+        groups: docker
+        append: yes
+
+    - name: "Config log rotation"
+      ansible.builtin.copy:
+        dest: /etc/docker/daemon.json
+        content: '{"log-driver":"json-file","log-opts":{"max-size":"10m","max-file":"3"}}'
+      register: d_cfg
+
+    - name: "Restart Docker"
+      ansible.builtin.systemd:
+        name: docker
+        state: restarted
+        enabled: yes
+      when: d_cfg.changed
+
+    - name: "Copy ufw management script from repo"
+      ansible.builtin.copy:
+        src: scripts/ufw.sh
+        dest: "/home/{{ ansible_user }}/ufw.sh"
+        mode: '0755'
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+
+# ── Wait for locks after Docker install ───────────────────────────────────
+- name: "Kill any running apt/dpkg processes (pre-utilities)"
+  ansible.builtin.shell: |
+    kill $(lsof /var/lib/dpkg/lock-frontend 2>/dev/null | awk 'NR>1 {print $2}') 2>/dev/null || true
+    kill $(lsof /var/lib/apt/lists/lock     2>/dev/null | awk 'NR>1 {print $2}') 2>/dev/null || true
+  changed_when: false
+
+- name: "Wait for apt/dpkg locks to clear (pre-utilities)"
+  ansible.builtin.shell: |
+    while fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock \
+                /var/cache/apt/archives/lock /var/lib/dpkg/lock \
+                >/dev/null 2>&1; do
+      sleep 3
+    done
+  changed_when: false
+  timeout: 120
+
+
+
+# ── UFW / Security ────────────────────────────────────────────────────────
+
+- name: "Ufw: Security"
+  when: secure_vm | bool
+  become: true
+  block:
+  - name: "Install UFW"
+    ansible.builtin.apt:
+      name: ufw
+      state: present
+
+  - name: "Install ufw-docker binary"
+    ansible.builtin.get_url:
+      url: https://raw.githubusercontent.com/chaifeng/ufw-docker/master/ufw-docker
+      dest: /usr/local/bin/ufw-docker
+      mode: '0755'
+
+  - name: "Copy ufw management script"
+    ansible.builtin.copy:
+      src: "{{ playbook_dir }}/scripts/ufw.sh"
+      dest: /opt/ufw.sh
+      mode: '0755'
+      owner: root
+      group: root
+
+  - name: "Enable UFW before ufw-docker install"
+    community.general.ufw:
+      state: enabled
+      policy: allow
+    failed_when: false
+
+  - name: "Flush DOCKER-USER chain before ufw-docker install"
+    ansible.builtin.iptables:
+      chain: DOCKER-USER
+      flush: true
+
+  - name: "Run ufw-docker install"
+    ansible.builtin.command: /usr/local/bin/ufw-docker install
+    changed_when: true
+
+  - name: "Reload UFW to apply ufw-docker after.rules patch"
+    community.general.ufw:
+      state: reloaded
+
+  - name: "Restart Docker so its chains load after UFW"
+    ansible.builtin.systemd:
+      name: docker
+      state: restarted
+

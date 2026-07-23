@@ -1,0 +1,38 @@
+services:
+  semaphore-db:
+    image: postgres:14-alpine
+    container_name: semaphore-db
+    restart: unless-stopped
+    volumes:
+      - semaphore-postgres-data:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_USER=semaphore
+      - POSTGRES_PASSWORD=semaphore_pass
+      - POSTGRES_DB=semaphore
+
+  semaphore:
+    image: semaphoreui/semaphore:latest
+    container_name: semaphore
+    ports:
+      - "3001:3000"
+    restart: unless-stopped
+    environment:
+      - SEMAPHORE_DB_USER=semaphore
+      - SEMAPHORE_DB_PASS=semaphore_pass
+      - SEMAPHORE_DB_HOST=semaphore-db
+      - SEMAPHORE_DB_PORT=5432
+      - SEMAPHORE_DB_DIALECT=postgres
+      - SEMAPHORE_DB=semaphore
+      - SEMAPHORE_ADMIN_PASSWORD=admin
+      - SEMAPHORE_ADMIN_NAME=Admin
+      - SEMAPHORE_ADMIN_EMAIL=admin@example.com
+      - SEMAPHORE_ADMIN=admin
+      - ANSIBLE_HOST_KEY_CHECKING=False
+    depends_on:
+      - semaphore-db
+    volumes:
+      - semaphore-config:/etc/semaphore
+
+volumes:
+  semaphore-postgres-data:
+  semaphore-config:

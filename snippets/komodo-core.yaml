@@ -1,0 +1,64 @@
+- name: "Ensure Komodo directory exists"
+  ansible.builtin.file:
+    path: "{{ komodo_dir }}"
+    state: directory
+    mode: '0777'
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+
+- name: "Ensure Komodo data subdirectories are accessible to everyone"
+  ansible.builtin.file:
+    path: "{{ komodo_dir }}/{{ item }}"
+    state: directory
+    mode: '0777'
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+  loop:
+    - 'ferretdb'
+    - 'postgres'
+    - 'keys'
+    - 'backups'
+
+- name: "Copy ferretdb.compose.yaml from repo"
+  ansible.builtin.copy:
+    src: komodo/komodo-core/ferretdb.compose.yaml
+    dest: "{{ komodo_dir }}/ferretdb.compose.yaml"
+    mode: '0644'
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+
+- name: "Copy base compose.env from repo"
+  ansible.builtin.copy:
+    src: komodo/komodo-core/compose.env
+    dest: "{{ komodo_dir }}/compose.env"
+    mode: '0600'
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+
+- name: "Inject Semaphore variables into compose.env"
+  ansible.builtin.blockinfile:
+    path: "{{ komodo_dir }}/compose.env"
+    marker: "# {mark} SEMAPHORE MANAGED VARIABLES"
+    block: |
+      KOMODO_VERSION={{ komodo_version }}
+      KOMODO_DATA_PATH={{ komodo_dir }}
+      KOMODO_DATABASE_USERNAME=admin
+      KOMODO_DATABASE_PASSWORD=admin
+
+- name: "Template core.config.toml with providers"
+  ansible.builtin.template:
+    src: komodo/komodo-core/core.config.toml.j2
+    dest: "{{ komodo_dir }}/core.config.toml"
+    mode: '0600'
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+
+- name: "Start Komodo Core stack"
+  community.docker.docker_compose_v2:
+    project_src: "{{ komodo_dir }}"
+    files:
+      - ferretdb.compose.yaml
+    env_files:
+      - "{{ komodo_dir }}/compose.env"
+    state: present
+    pull: always

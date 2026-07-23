@@ -1,0 +1,450 @@
+# ── Play 0 — AWX Dependencies ────────────────────────────────────────────────
+- name: "Install AWX EE dependencies"
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: "Install required Python packages"
+      ansible.builtin.pip:
+        name:
+          - proxmoxer
+          - requests
+        state: present
+
+# ──────────────────────────────────────────────────────────
+# PLAY 1 — Provision all VMs on Proxmox
+# ──────────────────────────────────────────────────────────
+- name: "Provision Cluster VMs"
+  hosts: proxmox
+  gather_facts: false
+  vars:
+    k8s_distro: "{{ k8s_distro | default('k3s') }}"
+    rke2_cni: "{{ rke2_cni | default('canal') }}"
+    pve_api:       "https://{{ ansible_host }}:8006/api2/json"
+    pve_token:     "PVEAPIToken={{ proxmox_token_id }}={{ proxmox_token_secret }}"
+    vm_user:       "{{ vm_user | default('astro') }}"
+    master_memory: "{{ master_memory | default(4096) }}"
+    master_cores:  "{{ master_cores | default(4) }}"
+    worker_memory: "{{ worker_memory | default(2048) }}"
+    worker_cores:  "{{ worker_cores | default(2) }}"
+    disk_size:     "{{ disk_size | default('30G') }}"
+    worker_count:  "{{ worker_count | default(2) }}"
+
+  tasks:
+    - name: "Validate rke2_cni value"
+      ansible.builtin.assert:
+        that:
+          - rke2_cni in ['canal', 'calico', 'cilium', 'flannel', 'none']
+        fail_msg: >-
+          Invalid rke2_cni value '{{ rke2_cni }}'.
+          Must be one of: canal, calico, cilium, flannel, none.
+        success_msg: "RKE2 CNI set to: {{ rke2_cni }}"
+      when: k8s_distro == "rke2"
+
+    - name: "Generate shared cluster suffix"
+      ansible.builtin.set_fact:
+        cluster_suffix: "{{ lookup('community.general.random_string', length=3, upper=false, special=false) }}"
+
+    - name: "Provision master node"
+      ansible.builtin.include_tasks: k8s_snippets/proxmox_k8s_node.yaml
+      vars:
+        new_vm_name:    "{{ cluster_name }}-{{ k8s_distro }}-master"
+        vm_name_suffix: "{{ cluster_suffix }}"
+        vm_memory:      "{{ master_memory }}"
+        vm_cores:       "{{ master_cores }}"
+        vm_disk_size:   "{{ disk_size }}"
+        node_group:     "k8s_masters"
+
+    - name: "Provision worker nodes"
+      ansible.builtin.include_tasks: k8s_snippets/proxmox_k8s_node.yaml
+      vars:
+        new_vm_name:    "{{ cluster_name }}-{{ k8s_distro }}-worker-{{ worker_idx }}"
+        vm_name_suffix: "{{ cluster_suffix }}"
+        vm_memory:      "{{ worker_memory }}"
+        vm_cores:       "{{ worker_cores }}"
+        vm_disk_size:   "{{ disk_size }}"
+        node_group:     "k8s_workers"
+      loop: "{{ range(1, worker_count | int + 1) | list }}"
+      loop_control:
+        loop_var: worker_idx
+        label: "worker-{{ worker_idx }}"
+
+# ──────────────────────────────────────────────────────────
+# PLAY 2 — Install Kubernetes Server (Master)
+# ──────────────────────────────────────────────────────────
+- name: "Install Master Node"
+  hosts: k8s_masters
+  gather_facts: false
+  vars:
+    distro:   "{{ k8s_distro | default('k3s') }}"
+    rke2_cni: "{{ rke2_cni | default('canal') }}"
+    k3s_ver:  "{{ k3s_version | default('v1.32.3+k3s1') }}"
+    rke2_ver: "{{ rke2_version | default('v1.30.2+rke2r1') }}"
+    vm_user:  "{{ vm_user | default('astro') }}"
+
+  tasks:
+    - name: "Wait for SSH"
+      ansible.builtin.wait_for_connection:
+        timeout: 120
+
+    # ── k3s ────────────────────────────────────────────────
+    - name: "Install k3s server"
+      when: distro == "k3s"
+      ansible.builtin.shell: |
+        curl -sfL https://get.k3s.io | \
+          INSTALL_K3S_VERSION="{{ k3s_ver }}" \
+          INSTALL_K3S_EXEC="server --disable traefik --node-name {{ inventory_hostname }}" \
+          INSTALL_K3S_SKIP_START=true \
+          sh -
+      args:
+        creates: /usr/local/bin/k3s
+
+    - name: "Start k3s service"
+      ansible.builtin.systemd:
+        name: k3s
+        state: started
+        enabled: true
+        daemon_reload: true
+      when: distro == "k3s"
+
+    - name: "Fix k3s kubeconfig permissions"
+      ansible.builtin.file:
+        path: /etc/rancher/k3s/k3s.yaml
+        mode: '0644'
+      when: distro == "k3s"
+
+    - name: "Set KUBECONFIG in user profile (k3s)"
+      ansible.builtin.lineinfile:
+        path:  "/home/{{ vm_user }}/.bashrc"
+        line:  "export KUBECONFIG=/etc/rancher/k3s/k3s.yaml"
+        state: present
+      when: distro == "k3s"
+
+    # ── RKE2 ───────────────────────────────────────────────
+    - name: "Install RKE2 server"
+      when: distro == "rke2"
+      block:
+        - name: "Run RKE2 installer"
+          ansible.builtin.shell: |
+            curl -sfL https://get.rke2.io | INSTALL_RKE2_VERSION="{{ rke2_ver }}" sh -
+          args:
+            creates: /usr/local/bin/rke2
+
+        - name: "Ensure RKE2 config directory exists"
+          ansible.builtin.file:
+            path: /etc/rancher/rke2
+            state: directory
+            mode: '0755'
+
+        - name: "Write RKE2 server config (CNI: {{ rke2_cni }})"
+          ansible.builtin.copy:
+            dest: /etc/rancher/rke2/config.yaml
+            content: |
+              node-name: {{ inventory_hostname }}
+              cni: {{ rke2_cni }}
+            mode: '0600'
+
+        - name: "Enable and start RKE2 server service"
+          ansible.builtin.systemd:
+            name: rke2-server
+            state: started
+            enabled: yes
+
+        - name: "Symlink RKE2 kubectl to PATH"
+          ansible.builtin.file:
+            src:   /var/lib/rancher/rke2/bin/kubectl
+            dest:  /usr/local/bin/kubectl
+            state: link
+
+        - name: "Fix RKE2 kubeconfig permissions"
+          ansible.builtin.file:
+            path: /etc/rancher/rke2/rke2.yaml
+            mode: '0644'
+
+        - name: "Set KUBECONFIG in user profile (rke2)"
+          ansible.builtin.lineinfile:
+            path:  "/home/{{ vm_user }}/.bashrc"
+            line:  "export KUBECONFIG=/etc/rancher/rke2/rke2.yaml"
+            state: present
+
+    - name: "Fetch node-token"
+      ansible.builtin.slurp:
+        src: "{{ (distro == 'k3s') | ternary('/var/lib/rancher/k3s/server/node-token', '/var/lib/rancher/rke2/server/node-token') }}"
+      register: k8s_token_raw
+
+    - name: "Share master info with workers"
+      ansible.builtin.add_host:
+        name:          "k8s_token_holder"
+        k8s_master_ip: "{{ ansible_host }}"
+        k8s_token:     "{{ k8s_token_raw.content | b64decode | trim }}"
+
+# ──────────────────────────────────────────────────────────
+# PLAY 3 — Join Workers
+# ──────────────────────────────────────────────────────────
+- name: "Join Workers"
+  hosts: k8s_workers
+  gather_facts: false
+  vars:
+    distro:        "{{ k8s_distro | default('k3s') }}"
+    k3s_ver:       "{{ k3s_version | default('v1.32.3+k3s1') }}"
+    rke2_ver:      "{{ rke2_version | default('v1.30.2+rke2r1') }}"
+    master_ip:     "{{ hostvars['k8s_token_holder']['k8s_master_ip'] }}"
+    cluster_token: "{{ hostvars['k8s_token_holder']['k8s_token'] }}"
+
+  tasks:
+    - name: "Wait for SSH"
+      ansible.builtin.wait_for_connection:
+        timeout: 120
+
+    # ── k3s ────────────────────────────────────────────────
+    - name: "Join as k3s agent"
+      when: distro == "k3s"
+      ansible.builtin.shell: |
+        curl -sfL https://get.k3s.io | \
+          INSTALL_K3S_VERSION="{{ k3s_ver }}" \
+          K3S_URL="https://{{ master_ip }}:6443" \
+          K3S_TOKEN="{{ cluster_token }}" \
+          INSTALL_K3S_EXEC="agent --node-name {{ inventory_hostname }}" \
+          sh -
+      args:
+        creates: /usr/local/bin/k3s
+
+    # ── RKE2 ───────────────────────────────────────────────
+    - name: "Join as RKE2 agent"
+      when: distro == "rke2"
+      block:
+        - name: "Run RKE2 agent installer"
+          ansible.builtin.shell: |
+            curl -sfL https://get.rke2.io | \
+              INSTALL_RKE2_TYPE="agent" \
+              INSTALL_RKE2_VERSION="{{ rke2_ver }}" \
+              sh -
+
+        - name: "Ensure RKE2 config directory exists"
+          ansible.builtin.file:
+            path: /etc/rancher/rke2
+            state: directory
+            mode: '0755'
+
+        - name: "Write RKE2 agent config"
+          ansible.builtin.copy:
+            dest: /etc/rancher/rke2/config.yaml
+            content: |
+              server: https://{{ master_ip }}:9345
+              token: {{ cluster_token }}
+              node-name: {{ inventory_hostname }}
+            mode: '0600'
+
+        - name: "Start RKE2 agent service"
+          ansible.builtin.systemd:
+            name: rke2-agent
+            state: started
+            enabled: yes
+
+# ──────────────────────────────────────────────────────────
+# PLAY 4 — Pull kubeconfig locally
+# ──────────────────────────────────────────────────────────
+- name: "Fetch kubeconfig"
+  hosts: k8s_masters
+  gather_facts: false
+  vars:
+    distro:      "{{ k8s_distro | default('k3s') }}"
+    remote_conf: "{{ (distro == 'k3s') | ternary('/etc/rancher/k3s/k3s.yaml', '/etc/rancher/rke2/rke2.yaml') }}"
+
+  tasks:
+    - name: "Download kubeconfig"
+      ansible.builtin.fetch:
+        src:  "{{ remote_conf }}"
+        dest: "./kubeconfig-{{ distro }}.yaml"
+        flat: true
+
+    - name: "Fix IP in local kubeconfig"
+      ansible.builtin.replace:
+        path:    "./kubeconfig-{{ distro }}.yaml"
+        regexp:  'https://127.0.0.1:6443'
+        replace: "https://{{ ansible_host }}:6443"
+      delegate_to: localhost
+
+# ──────────────────────────────────────────────────────────
+# PLAY 5 — Install Helm
+# ──────────────────────────────────────────────────────────
+- name: "Install Helm"
+  hosts: k8s_masters
+  gather_facts: false
+
+  tasks:
+    - name: "Install Helm"
+      ansible.builtin.shell: |
+        curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+      args:
+        creates: /usr/local/bin/helm
+      when: install_helm | default(false) | bool
+
+# ──────────────────────────────────────────────────────────
+# PLAY 6 — Install cert-manager + Rancher via Helm
+# ──────────────────────────────────────────────────────────
+- name: "Install Rancher"
+  hosts: k8s_masters
+  gather_facts: false
+  vars:
+    distro:               "{{ k8s_distro | default('k3s') }}"
+    kubeconfig:           "{{ (distro == 'k3s') | ternary('/etc/rancher/k3s/k3s.yaml', '/etc/rancher/rke2/rke2.yaml') }}"
+    rancher_hostname:     "{{ custom_rancher_hostname | default('rancher.' + ansible_host + '.nip.io') }}"
+    rancher_bootstrap_pw: "{{ vault_rancher_bootstrap_password }}"
+
+  environment:
+      KUBECONFIG: "{{ kubeconfig }}"
+      PATH: "{{ '/usr/local/bin:/usr/bin:/var/lib/rancher/rke2/bin:' + ansible_env.PATH if distro == 'rke2' else '/usr/local/bin:/usr/bin:' + ansible_env.PATH }}"
+
+  tasks:
+    - name: "Include rancher installation tasks"
+      ansible.builtin.include_tasks: k8s_snippets/rancher.yaml
+      when: install_rancher | default(false) | bool
+
+# ──────────────────────────────────────────────────────────
+# PLAY 7 — Install Istio via Helm
+# ──────────────────────────────────────────────────────────
+- name: "Install Istio"
+  hosts: k8s_masters
+  gather_facts: false
+  vars:
+    distro:     "{{ k8s_distro | default('k3s') }}"
+    kubeconfig: "{{ (distro == 'k3s') | ternary('/etc/rancher/k3s/k3s.yaml', '/etc/rancher/rke2/rke2.yaml') }}"
+    istio_ver:  "{{ istio_version | default('1.21.2') }}"
+
+  environment:
+      KUBECONFIG: "{{ kubeconfig }}"
+      PATH: "{{ '/usr/local/bin:/usr/bin:/var/lib/rancher/rke2/bin:' + ansible_env.PATH if distro == 'rke2' else '/usr/local/bin:/usr/bin:' + ansible_env.PATH }}"
+
+  tasks:
+    - name: "Include istio installation tasks"
+      ansible.builtin.include_tasks: k8s_snippets/istio.yaml
+      when: install_istio | default(false) | bool
+
+# ──────────────────────────────────────────────────────────
+# PLAY 8 — Install kube-bench binary
+# ──────────────────────────────────────────────────────────
+- name: "Install kube-bench"
+  hosts: k8s_masters:k8s_workers
+  gather_facts: false
+  vars:
+    kubebench_ver: "{{ kubebench_version | default('0.9.4') }}"
+
+  tasks:
+    - name: "Include kube-bench installation tasks"
+      ansible.builtin.include_tasks: k8s_snippets/kubebench.yaml
+      when: install_kubebench | default(false) | bool
+
+# ──────────────────────────────────────────────────────────
+# PLAY 9 — Install ArgoCD via Helm
+# ──────────────────────────────────────────────────────────
+- name: "Install ArgoCD"
+  hosts: k8s_masters
+  gather_facts: false
+  vars:
+    distro:          "{{ k8s_distro | default('k3s') }}"
+    kubeconfig:      "{{ (distro == 'k3s') | ternary('/etc/rancher/k3s/k3s.yaml', '/etc/rancher/rke2/rke2.yaml') }}"
+    argocd_ver:      "{{ argocd_version | default('7.7.16') }}"
+    argocd_hostname:     "{{ custom_argocd_hostname | default('argocd.' + ansible_host + '.nip.io') }}"
+
+  environment:
+      KUBECONFIG: "{{ kubeconfig }}"
+      PATH: "{{ '/usr/local/bin:/usr/bin:/var/lib/rancher/rke2/bin:' + ansible_env.PATH if distro == 'rke2' else '/usr/local/bin:/usr/bin:' + ansible_env.PATH }}"
+
+  tasks:
+    - name: "Include argocd installation tasks"
+      ansible.builtin.include_tasks: k8s_snippets/argocd.yaml
+      when: install_argocd | default(false) | bool
+
+# ──────────────────────────────────────────────────────────
+# PLAY 10 — Install Falco via Helm
+# ──────────────────────────────────────────────────────────
+- name: "Install Falco"
+  hosts: k8s_masters
+  gather_facts: false
+  vars:
+    distro:     "{{ k8s_distro | default('k3s') }}"
+    kubeconfig: "{{ (distro == 'k3s') | ternary('/etc/rancher/k3s/k3s.yaml', '/etc/rancher/rke2/rke2.yaml') }}"
+
+  environment:
+      KUBECONFIG: "{{ kubeconfig }}"
+      PATH: "{{ '/usr/local/bin:/usr/bin:/var/lib/rancher/rke2/bin:' + ansible_env.PATH if distro == 'rke2' else '/usr/local/bin:/usr/bin:' + ansible_env.PATH }}"
+
+  tasks:
+    - name: "Include falco installation tasks"
+      ansible.builtin.include_tasks: k8s_snippets/falco.yaml
+      when: install_falco | default(false) | bool
+
+# ──────────────────────────────────────────────────────────
+# PLAY 11 — Install Prometheus + kube-state-metrics via Helm
+# ──────────────────────────────────────────────────────────
+- name: "Install Prometheus"
+  hosts: k8s_masters
+  gather_facts: false
+  vars:
+    distro:              "{{ k8s_distro | default('k3s') }}"
+    kubeconfig:          "{{ (distro == 'k3s') | ternary('/etc/rancher/k3s/k3s.yaml', '/etc/rancher/rke2/rke2.yaml') }}"
+    prometheus_ns:       "{{ prometheus_namespace | default('monitoring') }}"
+    prometheus_nodeport: "{{ prom_nodeport | default('30090') }}"
+    istio_ver:           "{{ istio_version | default('1.21.2') }}"
+    ran_istio:            "{{ install_istio | default(false) | bool }}"
+
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+    PATH: "{{ '/usr/local/bin:/usr/bin:/var/lib/rancher/rke2/bin:' + ansible_env.PATH if distro == 'rke2' else '/usr/local/bin:/usr/bin:' + ansible_env.PATH }}"
+
+  tasks:
+    - name: "Include prometheus installation tasks"
+      ansible.builtin.include_tasks: k8s_snippets/prometheus.yaml
+      when: install_prometheus | default(false) | bool
+
+# ──────────────────────────────────────────────────────────
+# PLAY 12 — Cluster Summary
+# ──────────────────────────────────────────────────────────
+- name: "Cluster Summary"
+  hosts: k8s_masters
+  gather_facts: false
+  vars:
+    distro:           "{{ k8s_distro | default('k3s') }}"
+    argocd_hostname:  "argocd.{{ ansible_host }}.nip.io"
+    rancher_hostname: "{{ custom_rancher_hostname | default('rancher.' + ansible_host + '.nip.io') }}"
+    argocd_ver:       "{{ argocd_version | default('7.7.16') }}"
+    istio_ver:        "{{ istio_version | default('1.21.2') }}"
+
+    ran_rancher:   "{{ install_rancher   | default(false) | bool }}"
+    ran_istio:     "{{ install_istio     | default(false) | bool }}"
+    ran_argocd:    "{{ install_argocd    | default(false) | bool }}"
+    ran_falco:     "{{ install_falco     | default(false) | bool }}"
+    ran_kubebench: "{{ install_kubebench | default(false) | bool }}"
+
+  tasks:
+    - name: "Print summary"
+      ansible.builtin.debug:
+        msg:
+          - "=============================================="
+          - "         CLUSTER DEPLOYMENT SUMMARY          "
+          - "=============================================="
+          - ""
+          - "  Distro    : {{ distro | upper }}"
+          - "  Master    : {{ ansible_host }}"
+          - "  Kubeconfig: ./kubeconfig-{{ distro }}.yaml"
+          - ""
+          - "----------------------------------------------"
+          - "  ACCESS"
+          - "----------------------------------------------"
+          - "  Rancher : {{ 'https://' + rancher_hostname if ran_rancher else 'not installed' }}"
+          - "  ArgoCD  : {{ 'https://' + argocd_hostname if ran_argocd  else 'not installed' }}"
+          - ""
+          - "----------------------------------------------"
+          - "  INSTALLED COMPONENTS"
+          - "----------------------------------------------"
+          - "  Istio        : {{ istio_ver  if ran_istio    else 'not installed' }}"
+          - "  ArgoCD       : {{ argocd_ver if ran_argocd   else 'not installed' }}"
+          - "  Falco        : {{ 'latest'   if ran_falco    else 'not installed' }}"
+          - ""
+          - "----------------------------------------------"
+          - "  SECURITY"
+          - "----------------------------------------------"
+          - "  kube-bench : {{ 'installed on all nodes' if ran_kubebench else 'not installed' }}"
+          - "  Audit logs : /var/log/kubernetes/audit/audit.log"
+          - ""
+          - "=============================================="

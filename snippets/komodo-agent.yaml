@@ -1,0 +1,39 @@
+
+    - name: "Ensure Komodo Periphery directory exists"
+      ansible.builtin.file:
+        path: "{{ komodo_periphery_dir }}"
+        state: directory
+        mode: '0755'
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+
+
+
+    - name: "Copy periphery compose file from repo"
+      ansible.builtin.copy:
+        src: komodo/komodo-agent/docker-compose.yml
+        dest: "{{ komodo_periphery_dir }}/docker-compose.yml"
+        mode: '0644'
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+
+    - name: "Write periphery .env file"
+      ansible.builtin.copy:
+        dest: "{{ komodo_periphery_dir }}/.env"
+        mode: '0600'
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        content: |
+          KOMODO_VERSION={{ komodo_version }}
+          KOMODO_CORE_ADDRESS={{ komodo_core_address }}
+          KOMODO_SERVER_NAME={{ ansible_hostname }}
+          KOMODO_ONBOARDING_KEY={{ komodo_onboarding_key }}
+          PERIPHERY_ROOT_DIRECTORY={{ komodo_periphery_dir }}
+
+    - name: "Start Komodo Periphery stack"
+      community.docker.docker_compose_v2:
+        project_src: "{{ komodo_periphery_dir }}"
+        env_files:
+          - "{{ komodo_periphery_dir }}/.env"
+        state: present
+        pull: always

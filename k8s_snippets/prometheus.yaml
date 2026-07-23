@@ -1,0 +1,92 @@
+    - name: "Add prometheus-community Helm repo"
+      ansible.builtin.shell: |
+        helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+        helm repo update
+      args:
+        executable: /bin/bash
+
+    - name: "Create monitoring namespace"
+      ansible.builtin.shell: |
+        kubectl get namespace {{ prometheus_ns }} || kubectl create namespace {{ prometheus_ns }}
+      args:
+        executable: /bin/bash
+
+    - name: "Install local-path-provisioner if no StorageClass exists"
+      ansible.builtin.shell: |
+        if [ -z "$(kubectl get storageclass -o name 2>/dev/null)" ]; then
+          kubectl apply -f https://raw.githubusercontent.com/rancher/local-path-provisioner/master/deploy/local-path-storage.yaml
+          kubectl patch storageclass local-path -p '{"metadata": {"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
+        fi
+      args:
+        executable: /bin/bash
+
+    - name: "Install kube-prometheus-stack (Prometheus + kube-state-metrics, no Grafana)"
+      ansible.builtin.shell: |
+        helm upgrade --install prometheus prometheus-community/kube-prometheus-stack \
+          --namespace {{ prometheus_ns }} \
+          --set grafana.enabled=false \
+          --set alertmanager.enabled=false \
+          --set prometheus.prometheusSpec.retention=15d \
+          --set prometheus.prometheusSpec.storageSpec.volumeClaimTemplate.spec.resources.requests.storage=20Gi \
+          --set prometheus.prometheusSpec.podMonitorNamespaceSelector="null" \
+          --set prometheus.prometheusSpec.serviceMonitorNamespaceSelector="null" \
+          --set prometheus.prometheusSpec.podMonitorSelector="null" \
+          --set prometheus.prometheusSpec.serviceMonitorSelector="null" \
+          --set kubeStateMetrics.enabled=true \
+          --set nodeExporter.enabled=true \
+          --set prometheus.service.type=NodePort \
+          --set prometheus.service.nodePort={{ prometheus_nodeport }} \
+          --wait --timeout 5m
+      args:
+        executable: /bin/bash
+
+    - name: "Grant Prometheus operator RBAC to read monitors across all namespaces"
+      ansible.builtin.shell: |
+        kubectl apply -f - <<'EOF'
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: ClusterRole
+        metadata:
+          name: prometheus-operator-cross-namespace
+        rules:
+          - apiGroups: ["monitoring.coreos.com"]
+            resources: ["podmonitors", "servicemonitors", "prometheusrules"]
+            verbs: ["get", "list", "watch"]
+          - apiGroups: [""]
+            resources: ["endpoints", "pods", "services", "nodes", "namespaces"]
+            verbs: ["get", "list", "watch"]
+        ---
+        apiVersion: rbac.authorization.k8s.io/v1
+        kind: ClusterRoleBinding
+        metadata:
+          name: prometheus-operator-cross-namespace
+        roleRef:
+          apiGroup: rbac.authorization.k8s.io
+          kind: ClusterRole
+          name: prometheus-operator-cross-namespace
+        subjects:
+          - kind: ServiceAccount
+            name: prometheus-kube-prometheus-operator
+            namespace: "{{ prometheus_ns }}"
+          - kind: ServiceAccount
+            name: prometheus-kube-prometheus-prometheus
+            namespace: "{{ prometheus_ns }}"
+        EOF
+      args:
+        executable: /bin/bash
+
+    - name: "Apply Istio PodMonitors/ServiceMonitors and fix release label"
+      ansible.builtin.shell: |
+        kubectl apply -f https://raw.githubusercontent.com/istio/istio/release-{{ istio_ver | regex_replace('^(\d+\.\d+).*', '\1') }}/samples/addons/extras/prometheus-operator.yaml
+        kubectl label podmonitor envoy-stats-monitor -n istio-system release=prometheus --overwrite
+        kubectl label servicemonitor istio-component-monitor -n istio-system release=prometheus --overwrite
+      args:
+        executable: /bin/bash
+      when: ran_istio | bool
+
+    - name: "Print Prometheus NodePort endpoint"
+      ansible.builtin.debug:
+        msg:
+          - "Prometheus installed in namespace: {{ prometheus_ns }}"
+          - "NodePort endpoint: http://{{ ansible_host }}:{{ prometheus_nodeport }}"
+          - "Point your external Grafana datasource at the above URL."
+          - "{{ 'Istio scraping: PodMonitors/ServiceMonitors applied.' if ran_istio | bool else 'Istio scraping: not configured (istio tag not present).' }}"

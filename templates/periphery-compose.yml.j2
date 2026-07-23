@@ -1,0 +1,19 @@
+services:
+  periphery:
+    image: ghcr.io/moghtech/komodo-periphery:{{ komodo_version }}
+    init: true
+    restart: unless-stopped
+    environment:
+      PERIPHERY_CORE_ADDRESS: {{ komodo_core_address }}
+      PERIPHERY_CONNECT_AS: {{ ansible_hostname }}
+      PERIPHERY_ONBOARDING_KEY: {{ komodo_onboarding_key }}
+      PERIPHERY_CORE_PUBLIC_KEYS: file:/config/keys/core.pub
+      PERIPHERY_ROOT_DIRECTORY: {{ komodo_root_dir }}
+      PERIPHERY_DISABLE_TERMINALS: false
+      PERIPHERY_DISABLE_CONTAINER_EXEC: false
+      PERIPHERY_INCLUDE_DISK_MOUNTS: /etc/hostname
+    volumes:
+      - {{ komodo_root_dir }}/keys:/config/keys
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /proc:/proc
+      - {{ komodo_root_dir }}:/opt/data/komodo

@@ -1,0 +1,54 @@
+    - name: 1. Install WireGuard package
+      apt:
+        name: wireguard
+        state: present
+        update_cache: yes
+
+    - name: 2. Generate wg0.conf from template
+      copy:
+        dest: /etc/wireguard/wg0.conf
+ #       owner: root
+ #       group: root
+        mode: '0600'
+        content: |
+          [Interface]
+          PrivateKey = {{ client_private_key }}
+          Address = {{ client_address }}
+
+          [Peer]
+          PublicKey = {{ server_public_key }}
+          Endpoint = {{ server_endpoint }}
+          AllowedIPs = {{ AllowedIPs }}
+          PersistentKeepalive = {{ PersistentKeepalive}}
+
+    - name: 3. Enable and start WireGuard
+      systemd:
+        name: wg-quick@wg0
+        enabled: yes
+        state: started
+
+        
+    - name: 4. Deploy Watchdog script
+      copy:
+        dest: /usr/local/bin/wg-watchdog.sh
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          if ! wg show wg0 | grep -q "latest handshake"; then
+              systemctl restart wg-quick@wg0
+          fi
+
+    - name: 5. Add Watchdog to Cron
+      cron:
+        name: "WireGuard Reconnect Watchdog"
+        minute: "*"
+        job: "/usr/local/bin/wg-watchdog.sh"
+
+    - name: 6. Verify WireGuard Status
+      command: wg show
+      register: wg_status
+      changed_when: false
+
+    - name: Display WireGuard Status
+      debug:
+        var: wg_status.stdout_lines

@@ -1,0 +1,102 @@
+
+# ── Play 0 — AWX Dependencies ────────────────────────────────────────────────
+- name: "Install AWX EE dependencies"
+  hosts: localhost
+  gather_facts: false
+  tasks:
+    - name: "Install required Python packages"
+      ansible.builtin.pip:
+        name:
+          - proxmoxer
+          - requests
+        state: present
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PLAY 1 — Proxmox Provisioning
+# ══════════════════════════════════════════════════════════════════════════════
+- name: "Provision VM from Proxmox template"
+  hosts: proxmox
+  gather_facts: false
+  vars:
+    pve_api: "https://{{ ansible_host }}:8006/api2/json"
+    pve_token: "PVEAPIToken={{ proxmox_token_id }}={{ proxmox_token_secret }}"
+    vm_memory:    2048
+    vm_cores:     2
+    vm_disk_size: "20G"
+    template_id: 103
+
+
+  tasks:
+    - name: "Include Proxmox provisioning tasks"
+      ansible.builtin.include_tasks: snippets/proxmox.yaml
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PLAY 2 — Utilities
+# ══════════════════════════════════════════════════════════════════════════════
+- name: "Configure New VM"
+  hosts: new_vm
+  gather_facts: true
+  tasks:
+    - name: "Include bootstrap tasks"
+      ansible.builtin.include_tasks: snippets/utilities.yaml
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PLAY 3 — Wireguard
+# ══════════════════════════════════════════════════════════════════════════════
+- name: "Setup Wireguard"
+  hosts: new_vm
+  gather_facts: false
+  tasks:
+    - name: "Include wireguard tasks"
+      ansible.builtin.include_tasks: snippets/wireguard.yaml
+      when: setup_wireguard | bool
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PLAY 4 — Komodo Core (conditional)
+# ══════════════════════════════════════════════════════════════════════════════
+- name: "Deploy Komodo Core"
+  hosts: new_vm
+  gather_facts: false
+  tasks:
+    - name: "Include Komodo Core tasks"
+      ansible.builtin.include_tasks: snippets/komodo-core.yaml
+      when: setup_komodo_core | bool
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PLAY 5 — Komodo Periphery (conditional)
+# ══════════════════════════════════════════════════════════════════════════════
+- name: "Deploy Komodo Periphery"
+  hosts: new_vm
+  gather_facts: false
+  tasks:
+    - name: "Include Komodo Periphery tasks"
+      ansible.builtin.include_tasks: snippets/komodo-agent.yaml
+      when: setup_komodo_agent | bool and not setup_komodo_core | bool
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PLAY 6 — Summary
+# ══════════════════════════════════════════════════════════════════════════════
+- name: "Summary"
+  hosts: new_vm
+  gather_facts: false
+  tasks:
+    - name: "Print deployment summary"
+      ansible.builtin.debug:
+        msg:
+          - "════════════════════════════════════════"
+          - "        Deployment Summary"
+          - "════════════════════════════════════════"
+          - "  Host      : {{ inventory_hostname }}"
+          - "  IP        : {{ ansible_host }}"
+          - "  User      : {{ ansible_user }}"
+          - "  Docker    : {{ 'installed' if setup_docker | bool else 'skipped' }}"
+          - "  UFW       : {{ 'enabled' if secure_vm | bool else 'skipped' }}"
+          - "  WireGuard : {{ 'deployed' if setup_wireguard | bool else 'skipped' }}"
+          - "  Komodo    : {{ 'core' if setup_komodo_core | bool else 'periphery' if setup_komodo_agent | bool else 'skipped' }}"
+          - "════════════════════════════════════════"

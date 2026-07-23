@@ -1,0 +1,11 @@
+[[git_provider]]
+domain = "{{ komodo_git_domain }}"
+accounts = [
+  { username = "{{ komodo_git_username }}", token = "{{ komodo_git_token }}" },
+]
+
+[[docker_registry]]
+domain = "{{ komodo_registry_domain }}"
+accounts = [
+  { username = "{{ komodo_registry_username }}", token = "{{ komodo_registry_token }}" },
+]

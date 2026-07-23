@@ -1,0 +1,56 @@
+---
+
+    - name: Set system hostname
+      ansible.builtin.hostname:
+        name: "{{ ipa_hostname }}"
+
+    - name: Ensure the hostname is in /etc/hosts using inventory IP
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        line: "{{ hostvars[inventory_hostname]['ansible_host'] }} {{ ipa_hostname }} ipa"
+        regexp: ".*{{ ipa_hostname }}$"
+        state: present
+
+    - name: Install FreeIPA Server packages
+      ansible.builtin.dnf:
+        name:
+          - freeipa-server
+          - freeipa-server-dns
+        state: present
+
+    - name: Run FreeIPA installation
+      ansible.builtin.command:
+        cmd: >
+          ipa-server-install
+          --realm={{ ipa_realm }}
+          --domain={{ ipa_domain }}
+          --hostname={{ ipa_hostname }}
+          --ds-password={{ ds_password }}
+          --admin-password={{ admin_password }}
+          --unattended
+          --no-ntp
+          --skip-mem-check
+        creates: /etc/ipa/default.conf
+
+    - name: Open Firewall ports for FreeIPA
+      ansible.posix.firewalld:
+        service: "{{ item }}"
+        permanent: true
+        state: enabled
+        immediate: true
+      loop:
+        - freeipa-ldap
+        - freeipa-ldaps
+        - https
+        - http
+
+    - name: Verify hostname and internal resolution
+      ansible.builtin.shell: |
+        hostname -f
+        ping -c1 {{ ipa_hostname }}
+      register: check_output
+      changed_when: false
+
+    - name: Show verification results
+      ansible.builtin.debug:
+        msg: "{{ check_output.stdout_lines }}"

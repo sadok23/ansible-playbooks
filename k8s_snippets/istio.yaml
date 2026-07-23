@@ -1,0 +1,64 @@
+    - name: "Add Istio Helm repo"
+      ansible.builtin.command: helm repo add istio https://istio-release.storage.googleapis.com/charts
+      changed_when: false
+
+    - name: "Update Helm repos"
+      ansible.builtin.command: helm repo update
+      changed_when: false
+
+    - name: "Create istio-system namespace"
+      ansible.builtin.command: kubectl create namespace istio-system
+      register: ns_result
+      failed_when: ns_result.rc != 0 and 'already exists' not in ns_result.stderr
+      changed_when: ns_result.rc == 0
+
+    - name: "Install Istio base"
+      ansible.builtin.command: >
+        helm upgrade --install istio-base istio/base
+        --namespace istio-system
+        --version {{ istio_ver }}
+        --wait
+        --timeout 10m
+
+    - name: "Install istiod"
+      ansible.builtin.command: >
+        helm upgrade --install istiod istio/istiod
+        --namespace istio-system
+        --version {{ istio_ver }}
+        --wait
+        --timeout 10m
+
+    - name: "Verify istiod is running"
+      ansible.builtin.command: kubectl get pods -n istio-system
+      register: istio_pods
+      changed_when: false
+
+    - name: "Print Istio pod status"
+      ansible.builtin.debug:
+        msg: "{{ istio_pods.stdout_lines }}"
+
+    - name: "Add Kiali Helm repo"
+      ansible.builtin.command: helm repo add kiali https://kiali.org/helm-charts
+      changed_when: false
+
+    - name: "Update Helm repos"
+      ansible.builtin.command: helm repo update
+      changed_when: false
+
+    - name: "Install Kiali server"
+      ansible.builtin.command: >
+        helm upgrade --install kiali-server kiali/kiali-server
+        --namespace istio-system
+        --set auth.strategy="anonymous"
+        --set external_services.prometheus.url="http://prometheus-kube-prometheus-prometheus.monitoring.svc.cluster.local:9090"
+        --wait
+        --timeout 10m
+
+    - name: "Verify Kiali is running"
+      ansible.builtin.command: kubectl get pods -n istio-system
+      register: kiali_pods
+      changed_when: false
+
+    - name: "Print Kiali pod status"
+      ansible.builtin.debug:
+        msg: "{{ kiali_pods.stdout_lines }}"

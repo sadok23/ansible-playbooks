@@ -1,0 +1,144 @@
+    - name: "1. Get next available VMID"
+      ansible.builtin.uri:
+        url: "{{ pve_api }}/cluster/nextid"
+        method: GET
+        headers: { Authorization: "{{ pve_token }}" }
+        validate_certs: false
+      register: next_vmid_api
+      delegate_to: localhost
+
+    - name: "2. Generate random 3-char suffix"
+      ansible.builtin.set_fact:
+        vm_name_suffix: "{{ lookup('community.general.random_string', length=3, upper=false, special=false) }}"
+
+    - name: "3. Clone template to VMID {{ next_vmid_api.json.data }}"
+      community.general.proxmox_kvm:
+        api_host:         "{{ ansible_host }}"
+        api_user:         "{{ proxmox_token_id.split('!')[0] }}"
+        api_token_id:     "{{ proxmox_token_id.split('!')[1] }}"
+        api_token_secret: "{{ proxmox_token_secret }}"
+        node:             "{{ proxmox_node }}"
+        vmid:             "{{ template_id }}"
+        clone:            "{{ template_id }}"
+        newid:            "{{ next_vmid_api.json.data }}"
+        name:             "{{ new_vm_name }}-{{ vm_name_suffix }}"
+        full:             true
+        agent:            1
+        state:            present
+        timeout:          600
+        validate_certs:   false
+      delegate_to: localhost
+
+    - name: "4. Apply Hardware Config (RAM / CPU)"
+      community.general.proxmox_kvm:
+        api_host:         "{{ ansible_host }}"
+        api_user:         "{{ proxmox_token_id.split('!')[0] }}"
+        api_token_id:     "{{ proxmox_token_id.split('!')[1] }}"
+        api_token_secret: "{{ proxmox_token_secret }}"
+        node:             "{{ proxmox_node }}"
+        vmid:             "{{ next_vmid_api.json.data }}"
+        memory:           "{{ vm_memory }}"
+        cores:            "{{ vm_cores }}"
+        update:           true
+        validate_certs:   false
+
+      delegate_to: localhost
+
+    - name: "5. Resize Disk to {{ vm_disk_size }}"
+      ansible.builtin.uri:
+        url: "{{ pve_api }}/nodes/{{ proxmox_node }}/qemu/{{ next_vmid_api.json.data }}/resize"
+        method: PUT
+        headers: { Authorization: "{{ pve_token }}" }
+        body_format: form-urlencoded
+        body:
+          disk: "scsi0"
+          size: "{{ vm_disk_size }}"
+        validate_certs: false
+        status_code: [200, 422]
+      register: resize_result
+      changed_when: resize_result.status == 200
+      delegate_to: localhost
+
+    - name: "6. Configure Cloud-Init (User/Pass/Network)"
+      ansible.builtin.uri:
+        url: "{{ pve_api }}/nodes/{{ proxmox_node }}/qemu/{{ next_vmid_api.json.data }}/config"
+        method: PUT
+        headers: { Authorization: "{{ pve_token }}" }
+        body_format: form-urlencoded
+        body:
+          ciuser:     "{{ vm_user }}"
+          cipassword: "{{ vm_password }}"
+          ipconfig0: "{{ 'ip=' + static_vm_ip + ',gw=20.0.0.1' if static_vm_ip | default('') != '' else 'ip=dhcp' }}"
+        validate_certs: false
+      delegate_to: localhost
+
+    - name: "7. Start the VM"
+      community.general.proxmox_kvm:
+        api_host:         "{{ ansible_host }}"
+        api_user:         "{{ proxmox_token_id.split('!')[0] }}"
+        api_token_id:     "{{ proxmox_token_id.split('!')[1] }}"
+        api_token_secret: "{{ proxmox_token_secret }}"
+        node:             "{{ proxmox_node }}"
+        vmid:             "{{ next_vmid_api.json.data }}"
+        state:            started
+        validate_certs:   false
+
+      delegate_to: localhost
+
+    - name: "8. Wait for cloud-init via Agent"
+      ansible.builtin.uri:
+        url: "{{ pve_api }}/nodes/{{ proxmox_node }}/qemu/{{ next_vmid_api.json.data }}/agent/exec"
+        method: POST
+        headers: { Authorization: "{{ pve_token }}" }
+        body_format: json
+        body:
+          command: ["bash", "-c", "cloud-init status | grep -q 'done' && echo OK || exit 1"]
+        validate_certs: false
+        status_code: [200, 500]
+      register: ci_wait
+      until: ci_wait.status == 200
+      retries: 60
+      delay: 10
+      delegate_to: localhost
+
+    - name: "9. Agent-Config: Enable SSH Password Auth"
+      ansible.builtin.uri:
+        url: "{{ pve_api }}/nodes/{{ proxmox_node }}/qemu/{{ next_vmid_api.json.data }}/agent/exec"
+        method: POST
+        headers: { Authorization: "{{ pve_token }}" }
+        body_format: json
+        body:
+          command:
+            - "bash"
+            - "-c"
+            - |
+              sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+              sed -i 's/^#*PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config.d/*.conf 2>/dev/null || true
+              systemctl restart ssh || systemctl restart sshd
+        validate_certs: false
+      delegate_to: localhost
+
+    - name: "10. Discover IP via Guest Agent"
+      ansible.builtin.uri:
+        url: "{{ pve_api }}/nodes/{{ proxmox_node }}/qemu/{{ next_vmid_api.json.data }}/agent/network-get-interfaces"
+        method: GET
+        headers: { Authorization: "{{ pve_token }}" }
+        validate_certs: false
+      register: vm_interfaces_api
+      until:
+        - vm_interfaces_api.json.data is not none
+        - "'result' in vm_interfaces_api.json.data"
+        - "vm_interfaces_api.json.data.result | selectattr('name', 'ne', 'lo') | list | length > 0"
+      retries: 50
+      delay: 5
+      delegate_to: localhost
+
+    - name: "11. Add host to inventory"
+      ansible.builtin.add_host:
+        name: "new_vm"
+        ansible_host: "{{ vm_interfaces_api.json.data.result | selectattr('name', 'ne', 'lo') | map(attribute='ip-addresses') | flatten | selectattr('ip-address-type', 'eq', 'ipv4') | map(attribute='ip-address') | first }}"
+        ansible_user: "{{ vm_user }}"
+        ansible_password: "{{ vm_password }}"
+        ansible_become: true
+        ansible_become_pass: "{{ vm_password }}"
+        ansible_ssh_extra_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"

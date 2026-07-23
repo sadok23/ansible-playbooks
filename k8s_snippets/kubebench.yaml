@@ -1,0 +1,26 @@
+    - name: "Download kube-bench tarball"
+      ansible.builtin.shell: |
+        curl -sL https://github.com/aquasecurity/kube-bench/releases/download/v{{ kubebench_ver }}/kube-bench_{{ kubebench_ver }}_linux_amd64.tar.gz \
+          -o /tmp/kube-bench.tar.gz
+      args:
+        creates: /tmp/kube-bench.tar.gz
+
+    - name: "Extract kube-bench binary"
+      ansible.builtin.shell: |
+        tar -xz -f /tmp/kube-bench.tar.gz -C /usr/local/bin kube-bench
+      args:
+        creates: /usr/local/bin/kube-bench
+      become: true
+
+    - name: "Extract kube-bench cfg"
+      ansible.builtin.shell: |
+        tar -xz -f /tmp/kube-bench.tar.gz -C /tmp cfg
+        mkdir -p /etc/kube-bench
+        cp -r /tmp/cfg /etc/kube-bench/
+      args:
+        creates: /etc/kube-bench/cfg
+      become: true
+
+    - name: "Verify kube-bench installed"
+      ansible.builtin.command: kube-bench version
+      changed_when: false

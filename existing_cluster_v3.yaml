@@ -1,0 +1,204 @@
+# ──────────────────────────────────────────────────────────
+# PLAY 1 — Pull kubeconfig locally
+# ──────────────────────────────────────────────────────────
+- name: "Fetch kubeconfig"
+  hosts: target_node
+  gather_facts: false
+  vars:
+    distro:      "{{ k8s_distro | default('rke2') }}"
+    remote_conf: "{{ (distro == 'k3s') | ternary('/etc/rancher/k3s/k3s.yaml', '/etc/rancher/rke2/rke2.yaml') }}"
+
+  tasks:
+    - name: "Download kubeconfig"
+      ansible.builtin.fetch:
+        src:  "{{ remote_conf }}"
+        dest: "./kubeconfig-{{ distro }}.yaml"
+        flat: true
+
+    - name: "Fix IP in local kubeconfig"
+      ansible.builtin.replace:
+        path:    "./kubeconfig-{{ distro }}.yaml"
+        regexp:  'https://127.0.0.1:6443'
+        replace: "https://{{ ansible_host }}:6443"
+      delegate_to: localhost
+
+# ──────────────────────────────────────────────────────────
+# PLAY 2 — Install Helm
+# ──────────────────────────────────────────────────────────
+- name: "Install Helm"
+  tags: helm
+  hosts: target_node
+  gather_facts: false
+
+  tasks:
+    - name: "Install Helm"
+      ansible.builtin.shell: |
+        curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+      args:
+        creates: /usr/local/bin/helm
+
+# ──────────────────────────────────────────────────────────
+# PLAY 3 — Install cert-manager + Rancher via Helm
+# ──────────────────────────────────────────────────────────
+- name: "Install Rancher"
+  tags: rancher
+  hosts: target_node
+  gather_facts: false
+  vars:
+    distro:               "{{ k8s_distro | default('rke2') }}"
+    kubeconfig:           "{{ (distro == 'k3s') | ternary('/etc/rancher/k3s/k3s.yaml', '/etc/rancher/rke2/rke2.yaml') }}"
+    rancher_hostname:     "{{ custom_rancher_hostname | default('rancher.' + ansible_host + '.nip.io') }}"
+    rancher_bootstrap_pw: "{{ vault_rancher_bootstrap_password }}"
+
+  environment:
+      KUBECONFIG: "{{ kubeconfig }}"
+      PATH: "{{ '/usr/local/bin:/usr/bin:/var/lib/rancher/rke2/bin:' + ansible_env.PATH if distro == 'rke2' else '/usr/local/bin:/usr/bin:' + ansible_env.PATH }}"
+
+  tasks:
+    - name: "Include rancher installation tasks"
+      ansible.builtin.include_tasks: k8s_snippets/rancher.yaml
+
+# ──────────────────────────────────────────────────────────
+# PLAY 4 — Install Istio via Helm
+# ──────────────────────────────────────────────────────────
+- name: "Install Istio"
+  tags: istio
+  hosts: target_node
+  gather_facts: false
+  vars:
+    distro:     "{{ k8s_distro | default('rke2') }}"
+    kubeconfig: "{{ (distro == 'k3s') | ternary('/etc/rancher/k3s/k3s.yaml', '/etc/rancher/rke2/rke2.yaml') }}"
+    istio_ver:  "{{ istio_version | default('1.21.2') }}"
+
+  environment:
+      KUBECONFIG: "{{ kubeconfig }}"
+      PATH: "{{ '/usr/local/bin:/usr/bin:/var/lib/rancher/rke2/bin:' + ansible_env.PATH if distro == 'rke2' else '/usr/local/bin:/usr/bin:' + ansible_env.PATH }}"
+
+  tasks:
+    - name: "Include istio installation tasks"
+      ansible.builtin.include_tasks: k8s_snippets/istio.yaml
+
+# ──────────────────────────────────────────────────────────
+# PLAY 5 — Run kube-bench CIS security scan
+# ──────────────────────────────────────────────────────────
+- name: "Install kube-bench"
+  tags: kubebench
+  hosts: target_node
+  gather_facts: false
+  vars:
+    kubebench_ver: "{{ kubebench_version | default('0.9.4') }}"
+
+  tasks:
+    - name: "Include kube-bench installation tasks"
+      ansible.builtin.include_tasks: k8s_snippets/kubebench.yaml
+# ──────────────────────────────────────────────────────────
+# PLAY 6 — Install ArgoCD via Helm
+# ──────────────────────────────────────────────────────────
+- name: "Install ArgoCD"
+  tags: argocd
+  hosts: target_node
+  gather_facts: false
+  vars:
+    distro:          "{{ k8s_distro | default('rke2') }}"
+    kubeconfig:      "{{ (distro == 'k3s') | ternary('/etc/rancher/k3s/k3s.yaml', '/etc/rancher/rke2/rke2.yaml') }}"
+ #   argocd_hostname: "argocd.{{ ansible_host }}.nip.io"
+    argocd_hostname:     "{{ custom_argocd_hostname | default('argocd.' + ansible_host + '.nip.io') }}"
+
+
+  environment:
+      KUBECONFIG: "{{ kubeconfig }}"
+      PATH: "{{ '/usr/local/bin:/usr/bin:/var/lib/rancher/rke2/bin:' + ansible_env.PATH if distro == 'rke2' else '/usr/local/bin:/usr/bin:' + ansible_env.PATH }}"
+
+  tasks:
+    - name: "Include argocd installation tasks"
+      ansible.builtin.include_tasks: k8s_snippets/argocd.yaml
+
+# ──────────────────────────────────────────────────────────
+# PLAY 7 — Install Falco via Helm
+# ──────────────────────────────────────────────────────────
+- name: "Install Falco"
+  tags: falco
+  hosts: target_node
+  gather_facts: false
+  vars:
+    distro:     "{{ k8s_distro | default('rke2') }}"
+    kubeconfig: "{{ (distro == 'k3s') | ternary('/etc/rancher/k3s/k3s.yaml', '/etc/rancher/rke2/rke2.yaml') }}"
+
+  environment:
+      KUBECONFIG: "{{ kubeconfig }}"
+      PATH: "{{ '/usr/local/bin:/usr/bin:/var/lib/rancher/rke2/bin:' + ansible_env.PATH if distro == 'rke2' else '/usr/local/bin:/usr/bin:' + ansible_env.PATH }}"
+
+  tasks:
+    - name: "Include falco installation tasks"
+      ansible.builtin.include_tasks: k8s_snippets/falco.yaml
+
+
+# ──────────────────────────────────────────────────────────
+# PLAY 8 — Install Prometheus + kube-state-metrics via Helm
+# ──────────────────────────────────────────────────────────
+- name: "Install Prometheus"
+  tags: prometheus
+  hosts: target_node
+  gather_facts: false
+  vars:
+    distro:              "{{ k8s_distro | default('rke2') }}"
+    kubeconfig:          "{{ (distro == 'k3s') | ternary('/etc/rancher/k3s/k3s.yaml', '/etc/rancher/rke2/rke2.yaml') }}"
+    prometheus_ns:       "{{ prometheus_namespace | default('monitoring') }}"
+    prometheus_nodeport: "{{ prom_nodeport | default('30090') }}"
+    istio_ver:           "{{ istio_version | default('1.21.2') }}"
+
+    all_tags:  "{{ ansible_run_tags == ['all'] }}"
+    ran_istio: "{{ all_tags or 'istio' in ansible_run_tags }}"
+
+  environment:
+    KUBECONFIG: "{{ kubeconfig }}"
+    PATH: "{{ '/usr/local/bin:/usr/bin:/var/lib/rancher/rke2/bin:' + ansible_env.PATH if distro == 'rke2' else '/usr/local/bin:/usr/bin:' + ansible_env.PATH }}"
+
+  tasks:
+    - name: "Include prometheus installation tasks"
+      ansible.builtin.include_tasks: k8s_snippets/prometheus.yaml
+## ──────────────────────────────────────────────────────────
+# PLAY 9 — Cluster Summary
+# ──────────────────────────────────────────────────────────
+- name: "Cluster Summary"
+  tags: always
+  hosts: target_node
+  gather_facts: false
+  vars:
+    distro:              "{{ k8s_distro | default('rke2') }}"
+    argocd_hostname:     "argocd.{{ ansible_host }}.nip.io"
+    rancher_hostname:    "rancher.{{ ansible_host }}.nip.io"
+    prometheus_ns:       "{{ prometheus_namespace | default('monitoring') }}"
+    prometheus_nodeport: "{{ prom_nodeport | default('30090') }}"
+
+    all_tags:       "{{ ansible_run_tags == ['all'] }}"
+    ran_rancher:    "{{ all_tags or 'rancher'    in ansible_run_tags }}"
+    ran_istio:      "{{ all_tags or 'istio'      in ansible_run_tags }}"
+    ran_argocd:     "{{ all_tags or 'argocd'     in ansible_run_tags }}"
+    ran_falco:      "{{ all_tags or 'falco'      in ansible_run_tags }}"
+    ran_kubebench:  "{{ all_tags or 'kubebench'  in ansible_run_tags }}"
+    ran_prometheus: "{{ all_tags or 'prometheus' in ansible_run_tags }}"
+
+  tasks:
+    - name: "Print summary"
+      ansible.builtin.debug:
+        msg:
+          - "=============================================="
+          - "         CLUSTER DEPLOYMENT SUMMARY          "
+          - "=============================================="
+          - ""
+          - "  Distro    : {{ distro | upper }}"
+          - "  Master    : {{ ansible_host }}"
+          - "  Kubeconfig: ./kubeconfig-{{ distro }}.yaml"
+          - "----------------------------------------------"
+          - "  ACCESS"
+          - "----------------------------------------------"
+          - "  Rancher    : {{ 'https://' + rancher_hostname if ran_rancher else 'not installed' }}"
+          - "  ArgoCD     : {{ 'https://' + argocd_hostname if ran_argocd else 'not installed' }}"
+          - "  Prometheus : {{ 'http://' + ansible_host + ':' + prometheus_nodeport if ran_prometheus else 'not installed' }}"
+          - "----------------------------------------------"
+          - "  OBSERVABILITY"
+          - "----------------------------------------------"
+          - "  Prometheus : {{ 'installed' if ran_prometheus else 'not installed' }}"
+          - "  Istio scraping : {{ 'enabled' if ran_istio and ran_prometheus else 'not configured' }}"
+          - "=============================================="
